@@ -1,42 +1,61 @@
 services:
   backend:
-    build: .
-    container_name: openshorts-backend
-    ports:
-      - "8000:8000"
-    volumes:
-      - .:/app
-      - /app/__pycache__
-      - ./output:/app/output
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GPU: "1"
     restart: unless-stopped
+    environment:
+      WHISPER_MODEL: large-v3-turbo
+      WHISPER_DEVICE: cuda
+      WHISPER_COMPUTE: float16
+      TRANSCRIBE_BACKEND: whisper
+      ASR_GPU_CONCURRENCY: "1"
+      FFMPEG_ENCODER: auto
+      MAX_CONCURRENT_JOBS: "1"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, video]
+    volumes:
+      - openshorts-output:/app/output
+      - openshorts-uploads:/app/uploads
+      - openshorts-models:/app/.cache/huggingface
 
   frontend:
     build:
       context: ./dashboard
+      dockerfile: Dockerfile
       target: dev
-    container_name: openshorts-frontend
+    restart: unless-stopped
     ports:
       - "5175:5173"
-    volumes:
-      - ./dashboard:/app
-      - /app/node_modules
-    restart: unless-stopped
+    environment:
+      VITE_PROXY_TARGET: http://backend:8000
+      VITE_RENDER_TARGET: http://renderer:3100
     depends_on:
       - backend
+      - renderer
 
   renderer:
     build:
       context: .
       dockerfile: render-service/Dockerfile
-    container_name: openshorts-renderer
-    ports:
-      - "3100:3100"
-    volumes:
-      - ./output:/output
-    environment:
-      - REMOTION_BUNDLE_PATH=/app/remotion
-      - OUTPUT_DIR=/output
-      - PORT=3100
     restart: unless-stopped
-    depends_on:
-      - backend
+    environment:
+      REMOTION_BUNDLE_PATH: /app/remotion
+      OUTPUT_DIR: /output
+      PORT: "3100"
+    volumes:
+      - openshorts-output:/output
+
+volumes:
+  openshorts-output:
+  openshorts-uploads:
+  openshorts-models:
