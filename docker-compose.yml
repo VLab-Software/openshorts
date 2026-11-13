@@ -6,6 +6,8 @@ services:
       args:
         GPU: "1"
     restart: unless-stopped
+    ports:
+      - "5160:5160"
     environment:
       WHISPER_MODEL: large-v3-turbo
       WHISPER_DEVICE: cuda
