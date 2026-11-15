@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { X, Loader2, Crosshair, RotateCcw, AlertCircle, Play, Pause, Columns2 } from 'lucide-react';
+import { X, Loader2, Crosshair, RotateCcw, AlertCircle, Play, Pause, Columns2, Monitor } from 'lucide-react';
 import { getApiUrl } from '../config';
 import { apiJson } from '../lib/api';
 
@@ -85,7 +85,7 @@ export default function ReframeEditor({ jobId, clipIndex, clipTitle, onClose, on
     const toggleSplit = useCallback((idx, scene) => {
         setOverrides((o) => {
             const cur = o[idx];
-            if (cur && typeof cur === 'object') {
+            if (cur && typeof cur === 'object' && 'top' in cur) {
                 // back to a single window, kept where the top half was
                 return { ...o, [idx]: cur.top?.x ?? 0.5 };
             }
@@ -99,6 +99,46 @@ export default function ReframeEditor({ jobId, clipIndex, clipTitle, onClose, on
             } };
         });
     }, [clamp]);
+
+    const toggleCamScreen = useCallback((idx, scene) => {
+        setOverrides((o) => {
+            const cur = o[idx];
+            if (cur && typeof cur === 'object' && 'camera' in cur) {
+                return { ...o, [idx]: clamp(scene.suggested_center) };
+            }
+            const cx = scene.suggested_center ?? 0.14;
+            const cy = scene.suggested_center_y ?? 0.16;
+            const camW = 0.24;
+            const camH = 0.24;
+            const x = Math.min(1 - camW, Math.max(0, cx - camW / 2));
+            const y = Math.min(1 - camH, Math.max(0, cy - camH / 2));
+            return {
+                ...o,
+                [idx]: {
+                    camera: { x, y, w: camW, h: camH },
+                    screen: { x: 0, y: 0, w: 1, h: 1 },
+                },
+            };
+        });
+    }, [clamp]);
+
+    const setCameraBox = useCallback((idx, fx, fy) => {
+        setOverrides((o) => {
+            const cur = o[idx];
+            const cam = (cur && cur.camera) || { x: 0.02, y: 0.03, w: 0.24, h: 0.24 };
+            const w = cam.w ?? 0.24;
+            const h = cam.h ?? 0.24;
+            const x = Math.min(1 - w, Math.max(0, fx - w / 2));
+            const y = Math.min(1 - h, Math.max(0, fy - h / 2));
+            return {
+                ...o,
+                [idx]: {
+                    camera: { x, y, w, h },
+                    screen: (cur && cur.screen) || { x: 0, y: 0, w: 1, h: 1 },
+                },
+            };
+        });
+    }, []);
 
     const resetScene = useCallback((idx) => {
         setOverrides((o) => {
@@ -117,10 +157,25 @@ export default function ReframeEditor({ jobId, clipIndex, clipTitle, onClose, on
         try {
             const payload = Object.fromEntries(Object.entries(overrides).map(([k, v]) => [
                 String(k),
-                typeof v === 'object'
-                    ? { top: { x: Number(v.top.x.toFixed(4)), y: Number(v.top.y.toFixed(4)) },
-                        bottom: { x: Number(v.bottom.x.toFixed(4)), y: Number(v.bottom.y.toFixed(4)) } }
-                    : Number(v.toFixed(4)),
+                (v && typeof v === 'object' && 'camera' in v)
+                    ? {
+                        camera: {
+                            x: Number(v.camera.x.toFixed(4)),
+                            y: Number(v.camera.y.toFixed(4)),
+                            w: Number((v.camera.w ?? 0.24).toFixed(4)),
+                            h: Number((v.camera.h ?? 0.24).toFixed(4)),
+                        },
+                        screen: {
+                            x: Number((v.screen?.x ?? 0).toFixed(4)),
+                            y: Number((v.screen?.y ?? 0).toFixed(4)),
+                            w: Number((v.screen?.w ?? 1).toFixed(4)),
+                            h: Number((v.screen?.h ?? 1).toFixed(4)),
+                        },
+                    }
+                    : (v && typeof v === 'object')
+                        ? { top: { x: Number(v.top.x.toFixed(4)), y: Number(v.top.y.toFixed(4)) },
+                            bottom: { x: Number(v.bottom.x.toFixed(4)), y: Number(v.bottom.y.toFixed(4)) } }
+                        : Number(v.toFixed(4)),
             ]));
             const res = await apiJson('/api/clip/reframe', {
                 method: 'POST',
@@ -187,7 +242,9 @@ export default function ReframeEditor({ jobId, clipIndex, clipTitle, onClose, on
                             onPlayToggle={() => setPlaying((p) => (p === scene.index ? null : scene.index))}
                             onMoveSingle={(f) => setSingle(scene.index, f)}
                             onMoveHalf={(which, f) => setSplitHalf(scene.index, which, f)}
+                            onMoveCamera={(fx, fy) => setCameraBox(scene.index, fx, fy)}
                             onToggleSplit={() => toggleSplit(scene.index, scene)}
+                            onToggleCamScreen={() => toggleCamScreen(scene.index, scene)}
                             onReset={() => resetScene(scene.index)}
                         />
                     ))}
@@ -222,12 +279,14 @@ export default function ReframeEditor({ jobId, clipIndex, clipTitle, onClose, on
 // seeked to this scene, so the rectangle can be judged against moving pictures
 // and sound rather than a single still.
 function SceneRow({ scene, value, widthFraction, previewUrl, touched, playing,
-                    onPlayToggle, onMoveSingle, onMoveHalf, onToggleSplit, onReset }) {
+                    onPlayToggle, onMoveSingle, onMoveHalf, onMoveCamera,
+                    onToggleSplit, onToggleCamScreen, onReset }) {
     const boxRef = useRef(null);
     const videoRef = useRef(null);
-    const [dragging, setDragging] = useState(null);   // null | 'single' | 'top' | 'bottom'
+    const [dragging, setDragging] = useState(null);   // null | 'single' | 'top' | 'bottom' | 'camera'
 
-    const isSplit = value && typeof value === 'object';
+    const isCamScreen = value && typeof value === 'object' && 'camera' in value;
+    const isSplit = value && typeof value === 'object' && 'top' in value;
 
     // Play only this scene's slice of the shared preview.
     useEffect(() => {
@@ -248,10 +307,26 @@ function SceneRow({ scene, value, widthFraction, previewUrl, touched, playing,
         return (clientX - rect.left) / rect.width;
     }, []);
 
+    const pointFromEvent = useCallback((clientX, clientY) => {
+        const el = boxRef.current;
+        if (!el) return [0.5, 0.5];
+        const rect = el.getBoundingClientRect();
+        return [
+            (clientX - rect.left) / rect.width,
+            (clientY - rect.top) / rect.height,
+        ];
+    }, []);
+
     useEffect(() => {
         if (!dragging) return;
         const move = (e) => {
             const x = e.touches ? e.touches[0].clientX : e.clientX;
+            const y = e.touches ? e.touches[0].clientY : e.clientY;
+            if (dragging === 'camera') {
+                const [fx, fy] = pointFromEvent(x, y);
+                onMoveCamera(fx, fy);
+                return;
+            }
             const f = fractionFromEvent(x);
             if (dragging === 'single') onMoveSingle(f);
             else onMoveHalf(dragging, f);
@@ -267,14 +342,21 @@ function SceneRow({ scene, value, widthFraction, previewUrl, touched, playing,
             window.removeEventListener('touchmove', move);
             window.removeEventListener('touchend', up);
         };
-    }, [dragging, fractionFromEvent, onMoveSingle, onMoveHalf]);
+    }, [dragging, fractionFromEvent, pointFromEvent, onMoveSingle, onMoveHalf, onMoveCamera]);
 
     const startDrag = (which) => (e) => {
         e.stopPropagation();
         setDragging(which);
         const x = e.touches ? e.touches[0].clientX : e.clientX;
-        if (which === 'single') onMoveSingle(fractionFromEvent(x));
-        else onMoveHalf(which, fractionFromEvent(x));
+        const y = e.touches ? e.touches[0].clientY : e.clientY;
+        if (which === 'camera') {
+            const [fx, fy] = pointFromEvent(x, y);
+            onMoveCamera(fx, fy);
+        } else if (which === 'single') {
+            onMoveSingle(fractionFromEvent(x));
+        } else {
+            onMoveHalf(which, fractionFromEvent(x));
+        }
     };
 
     const win = (centre, label, which) => {
@@ -312,6 +394,14 @@ function SceneRow({ scene, value, widthFraction, previewUrl, touched, playing,
                     </span>
                 </div>
                 <div className="flex items-center gap-3 shrink-0">
+                    <button
+                        onClick={onToggleCamScreen}
+                        className={`flex items-center gap-1 transition-colors ${
+                            isCamScreen ? 'text-brass' : 'text-muted hover:text-ink2'}`}
+                        title="camera on top, central captions, and screen/game below"
+                    >
+                        <Monitor size={12} /> cam + screen
+                    </button>
                     <button
                         onClick={onToggleSplit}
                         className={`flex items-center gap-1 transition-colors ${
@@ -355,7 +445,7 @@ function SceneRow({ scene, value, widthFraction, previewUrl, touched, playing,
 
                 {/* Everything outside the kept region is dimmed, so what survives
                     the crop is what stays bright. */}
-                {!isSplit && (
+                {!isSplit && !isCamScreen && (
                     <>
                         <div className="absolute inset-y-0 left-0 bg-black/65 pointer-events-none"
                              style={{ width: `${Math.max(0, (value - widthFraction / 2) * 100)}%` }} />
@@ -364,11 +454,41 @@ function SceneRow({ scene, value, widthFraction, previewUrl, touched, playing,
                     </>
                 )}
 
-                {isSplit
+                {isCamScreen ? (
+                    <>
+                        <div className="absolute inset-0 border border-brass/50 pointer-events-none">
+                            <span className="absolute bottom-1 right-1 text-[10px] px-1 rounded bg-paper2/90 text-ink2 lowercase">
+                                screen (bottom)
+                            </span>
+                        </div>
+                        <div
+                            onMouseDown={startDrag('camera')}
+                            onTouchStart={startDrag('camera')}
+                            className="absolute border-2 border-brass cursor-move bg-brass/10"
+                            style={{
+                                left: `${(value.camera.x ?? 0.02) * 100}%`,
+                                top: `${(value.camera.y ?? 0.03) * 100}%`,
+                                width: `${(value.camera.w ?? 0.24) * 100}%`,
+                                height: `${(value.camera.h ?? 0.24) * 100}%`,
+                            }}
+                        >
+                            <span className="absolute top-0.5 left-0.5 text-[10px] px-1 rounded bg-brass text-paper lowercase">
+                                camera (top)
+                            </span>
+                        </div>
+                    </>
+                ) : isSplit
                     ? [win(value.top.x, 'top', 'top'), win(value.bottom.x, 'bottom', 'bottom')]
                     : win(value, null, 'single')}
             </div>
 
+            {isCamScreen && (
+                <p className="text-[11px] text-muted leading-snug">
+                    Composes in 9:16 with <strong>camera</strong> on top, subtitles in a
+                    central band, and <strong>screen</strong> below without stretching. Drag
+                    the camera box onto the streamer&apos;s webcam.
+                </p>
+            )}
             {isSplit && (
                 <p className="text-[11px] text-muted leading-snug">
                     Two regions stacked in the vertical frame: <strong>top</strong> above,

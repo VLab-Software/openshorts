@@ -203,3 +203,29 @@ class TestNeighbourClamp:
         widths = [int(seg.split("w=")[1].split(":")[0])
                   for seg in graph.split("crop=")[1:]]
         assert all(w <= 600 for w in widths)
+
+    def test_panel_filtergraph_is_readable_by_gpu_render(self):
+        import gpu_render
+        for centres in (
+            [(300, 400, 200, 200), (900, 400, 200, 200), (1500, 400, 200, 200)],
+            [(200, 400, 180, 180), (700, 400, 180, 180), (1200, 400, 180, 180), (1700, 400, 180, 180)],
+        ):
+            graph = panel_filtergraph(1920, 1080, 1080, 1920, centres)
+            layers = gpu_render.layers_from_graph(graph, 1920, 1080, 1080, 1920)
+            assert len(layers) == 4
+
+    def test_duplicate_panels_detected_on_identical_feed_regions(self):
+        import numpy as np
+        from panel_layout import has_duplicate_panels
+        # Distinct gradient regions pass
+        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        frame[:, :640] = [255, 20, 20]
+        frame[:, 640:1280] = [20, 255, 20]
+        frame[:, 1280:] = [20, 20, 255]
+        centres = [(320, 400, 180, 180), (960, 400, 180, 180), (1600, 400, 180, 180)]
+        assert not has_duplicate_panels(centres, 1920, 1080, frame=frame)
+
+        # Two panels showing the exact same feed pattern are flagged as duplicate
+        dup_frame = frame.copy()
+        dup_frame[:, 640:1280] = dup_frame[:, :640]
+        assert has_duplicate_panels(centres, 1920, 1080, frame=dup_frame)

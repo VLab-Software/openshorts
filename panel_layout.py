@@ -24,6 +24,7 @@ import os
 
 import numpy as np
 
+import frame_sampler
 import split_layout
 
 ENABLED = os.environ.get("PANEL_LAYOUT", "0") == "1"
@@ -183,6 +184,46 @@ def neighbour_gaps(centres):
     return gaps
 
 
+def has_duplicate_panels(centres, orig_w, orig_h, out_w=1080, out_h=1920,
+                         frame=None, max_iou=0.10, max_similarity=0.96):
+    """Return True when two candidate panel crops overlap significantly in
+    source coordinates (introduced duplication) or when two extracted regions
+    are near-identical in pixel content (duplicate feed in the source mosaic).
+    """
+    if not centres or len(centres) < 2:
+        return False
+    _c, _r, tile_w, tile_h = tile_grid(len(centres), out_w, out_h)
+    gaps = neighbour_gaps(centres)
+    boxes = []
+    for i, centre in enumerate(centres):
+        cw, ch, cx, cy = panel_geometry(
+            orig_w, orig_h, tile_w, tile_h, centre, neighbour_gap=gaps[i]
+        )
+        boxes.append([cx, cy, cw, ch])
+
+    for i, a in enumerate(boxes):
+        for b in boxes[i + 1:]:
+            if split_layout._iou(a, b) > max_iou:
+                return True
+
+    if frame is not None and hasattr(frame, "shape") and len(frame.shape) >= 2:
+        import cv2
+        patches = []
+        for x, y, w, h in boxes:
+            crop = frame[max(0, y):min(orig_h, y + h), max(0, x):min(orig_w, x + w)]
+            if crop.size == 0:
+                continue
+            small = cv2.resize(crop, (32, 32)).astype(float)
+            norm = np.linalg.norm(small)
+            patches.append(small / norm if norm > 0 else small)
+        for i, pa in enumerate(patches):
+            for pb in patches[i + 1:]:
+                sim = float(np.sum(pa * pb))
+                if sim >= max_similarity:
+                    return True
+    return False
+
+
 def panel_filtergraph(orig_w, orig_h, out_w, out_h, centres):
     """Tile 3 or 4 people into the vertical frame, left-to-right, top-to-bottom."""
     count = len(centres)
@@ -231,8 +272,10 @@ def detect_panel_scenes(video_path, scenes, strategies, samples=None):
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
     found = {}
+    plan = []
 
     try:
         for i, (start, end) in enumerate(scenes):
@@ -252,21 +295,30 @@ def detect_panel_scenes(video_path, scenes, strategies, samples=None):
             if last_f < s_f:
                 continue
 
+            plan.append((i, n, [int(round(f)) for f in np.linspace(s_f, last_f, n)]))
+
+        flat = [f_idx for _i, _n, idxs in plan for f_idx in idxs]
+        frames = frame_sampler.read_at_path(video_path, cap, flat)
+        for i, n, idxs in plan:
             sampled = []
-            for f_idx in np.linspace(s_f, last_f, n):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, int(round(f_idx)))
-                ok, frame = cap.read()
-                if not ok:
+            mid_frame = None
+            for k, _f_idx in enumerate(idxs):
+                frame = next(frames)
+                if frame is None:
                     continue
                 if frame.mean() < 16:
                     continue
+                if k == len(idxs) // 2 or mid_frame is None:
+                    mid_frame = frame
                 sampled.append(m.detect_face_candidates(frame))
 
             if len(sampled) < max(4, n // 2):
                 continue
 
             centres = analyze_scene(sampled, frame_w)
-            if centres:
+            if centres and not has_duplicate_panels(
+                centres, frame_w, frame_h, frame=mid_frame
+            ):
                 found[i] = centres
     finally:
         cap.release()

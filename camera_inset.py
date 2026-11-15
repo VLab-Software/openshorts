@@ -390,39 +390,254 @@ def present_in_scene(video_path, box, start_f, end_f, samples=3):
 
 
 MAX_CAMERA_RATIO = 0.40
+MIN_SCREEN_RATIO = 0.28
+DEFAULT_CAPTION_BAND_RATIO = float(os.environ.get("CAPTION_BAND_RATIO", "0.08"))
+TOP_SAFE_RATIO = 0.05
+BOTTOM_SAFE_RATIO = 0.12
+MIN_CONFIDENCE = float(os.environ.get("INSET_MIN_CONFIDENCE", "0.55"))
+ENABLED = os.environ.get("CAM_SCREEN_LAYOUT", os.environ.get("INSET_LAYOUT", "0")) == "1"
 
 
-def inset_filtergraph(orig_w, orig_h, out_w, out_h, box, camera_ratio=None):
-    """Screen on top at full width, the webcam inset below.
+def score_inset_samples(boxes, frame_w, frame_h, total_samples=None, min_agree=3):
+    """Evaluate sampled inset candidates and return confidence + diagnostics.
 
-    The screen keeps its whole width, which is the point: a game HUD or a
-    desktop puts what matters at the edges. The inset is scaled up so the person
-    reads at a size the source never gave them.
+    Pure function so tests can verify confidence scoring, layout changes and
+    fallback triggers without decoding video.
 
-    The camera band takes its height from the INSET'S OWN aspect ratio rather
-    than a fixed share of the frame. A fixed share was tried first and stretched
-    every face sideways: a 16:9 inset forced into a 2:1 band is a 12% horizontal
-    stretch, and it is immediately visible on a face.
+    Returns a dict:
+      - ``box``: median (x, y, w, h) tuple, or None when unusable/unstable
+      - ``confidence``: float in [0.0, 1.0]
+      - ``presence_ratio``: share of sampled frames with a cornered candidate
+      - ``agreement_ratio``: share of candidates matching the dominant position
+      - ``position_changes``: number of quadrant shifts across samples
+      - ``fallback_recommended``: True when uncertain or layout is unstable
     """
-    box_w = max(2, box[2])
-    box_h = max(2, box[3])
+    import numpy as np
+
+    total = max(1, int(total_samples if total_samples is not None else len(boxes) or 1))
+    presence_ratio = len(boxes) / float(total)
+    if not boxes:
+        return {
+            "box": None,
+            "confidence": 0.0,
+            "presence_ratio": 0.0,
+            "agreement_ratio": 0.0,
+            "position_changes": 0,
+            "fallback_recommended": True,
+        }
+
+    quadrants = [nearest_corner(b, frame_w, frame_h) for b in boxes]
+    position_changes = sum(
+        1 for i in range(1, len(quadrants)) if quadrants[i] != quadrants[i - 1]
+    )
+
+    arr = np.array(boxes, dtype=float)
+    centres_x = arr[:, 0] + arr[:, 2] / 2.0
+    centres_y = arr[:, 1] + arr[:, 3] / 2.0
+    mid_x, mid_y = np.median(centres_x), np.median(centres_y)
+    tolerance = frame_w * MAX_CENTRE_SPREAD
+    close = ((np.abs(centres_x - mid_x) <= tolerance)
+             & (np.abs(centres_y - mid_y) <= tolerance))
+    agreement_ratio = float(close.sum()) / float(len(boxes))
+
+    median = stable_box(boxes, frame_w, frame_h, min_agree=min_agree)
+    if median is None:
+        conf = round(min(0.45, presence_ratio * agreement_ratio * 0.6), 3)
+        return {
+            "box": None,
+            "confidence": conf,
+            "presence_ratio": round(presence_ratio, 3),
+            "agreement_ratio": round(agreement_ratio, 3),
+            "position_changes": position_changes,
+            "fallback_recommended": True,
+        }
+
+    # Combine presence across the clip, spatial stability, and quadrant consistency.
+    change_penalty = min(0.4, position_changes * 0.15)
+    raw_conf = (0.45 * min(1.0, presence_ratio / 0.7)
+                + 0.45 * agreement_ratio
+                + 0.10 * (1.0 if position_changes == 0 else 0.0)
+                - change_penalty)
+    conf = round(max(0.0, min(1.0, raw_conf)), 3)
+    return {
+        "box": median,
+        "confidence": conf,
+        "presence_ratio": round(presence_ratio, 3),
+        "agreement_ratio": round(agreement_ratio, 3),
+        "position_changes": position_changes,
+        "fallback_recommended": conf < MIN_CONFIDENCE or position_changes > 1,
+    }
+
+
+def detect_with_confidence(video_path, samples=10):
+    """Inspect distributed samples of ``video_path`` and return inset box +
+    confidence report (see ``score_inset_samples``)."""
+    import cv2
+    import main as m
+    import screencast_layout
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return score_inset_samples([], 0, 0, total_samples=samples)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if total <= 0 or not frame_w:
+        cap.release()
+        return score_inset_samples([], frame_w, frame_h, total_samples=samples)
+
+    boxes = []
+    valid_samples = 0
+    try:
+        for i in range(samples):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(i * total / samples))
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            valid_samples += 1
+            faces = screencast_layout.detect_faces_full_res(frame)
+            if faces:
+                box = max(faces, key=lambda c: c['score'])['box']
+            else:
+                box = m.detect_person_yolo(frame)
+            if not box:
+                continue
+            if not is_cornered(box, frame_w, frame_h):
+                continue
+            boxes.append(inset_box(box, frame_w, frame_h, face=bool(faces)))
+    finally:
+        cap.release()
+
+    need = max(3, samples // 3)
+    if len(boxes) < need:
+        return score_inset_samples([], frame_w, frame_h,
+                                   total_samples=max(1, valid_samples))
+    return score_inset_samples(boxes, frame_w, frame_h,
+                               total_samples=max(1, valid_samples),
+                               min_agree=need)
+
+
+def smooth_scene_insets(scenes, scene_boxes, fps, max_gap_seconds=1.5):
+    """Smooth per-scene inset presence so brief detector misses do not cause
+    jarring layout jumps, while genuine camera moves or absences fall back.
+
+    ``scenes``: list of (start, end) frame timecodes or frame-index pairs.
+    ``scene_boxes``: dict keyed by ``start_f`` (as in ``reframe_v2``) or
+    ``scene_idx``, mapping to ``(x, y, w, h) | dict | None``.
+    Returns a new dict with the same key convention, with short gaps bridged
+    and agreeing neighbour boxes stabilized to a single median box so the
+    camera crop does not jitter across scene boundaries.
+    """
+    import numpy as np
+
+    if not scenes or not scene_boxes:
+        return dict(scene_boxes or {})
+
+    def _frames(s, e):
+        sf = s.get_frames() if hasattr(s, "get_frames") else int(s)
+        ef = e.get_frames() if hasattr(e, "get_frames") else int(e)
+        return sf, ef
+
+    frame_pairs = [_frames(s, e) for s, e in scenes]
+    start_frames = [sf for sf, _ in frame_pairs]
+    # Determine whether caller keyed scene_boxes by start_f or by scene index.
+    non_zero_starts = [sf for sf in start_frames if sf != 0]
+    keyed_by_start = any(sf in scene_boxes for sf in non_zero_starts)
+
+    def _key(idx):
+        return start_frames[idx] if keyed_by_start else idx
+
+    by_idx = {}
+    for idx in range(len(scenes)):
+        val = scene_boxes.get(_key(idx))
+        if val is None and keyed_by_start:
+            val = scene_boxes.get(idx)
+        if val is not None:
+            by_idx[idx] = val
+
+    def _box_tuple(val):
+        if isinstance(val, dict):
+            return tuple(val.get("camera") or ())
+        return tuple(val) if val else ()
+
+    def _same_spot(a, b):
+        ta, tb = _box_tuple(a), _box_tuple(b)
+        if len(ta) < 4 or len(tb) < 4:
+            return False
+        tol = max(ta[2], tb[2], 20) * 0.25
+        return abs(ta[0] - tb[0]) <= tol and abs(ta[1] - tb[1]) <= tol
+
+    fps = float(fps or 30.0)
+    for i in range(1, len(scenes) - 1):
+        if i in by_idx:
+            continue
+        prev_box = by_idx.get(i - 1)
+        next_box = by_idx.get(i + 1)
+        if not prev_box or not next_box:
+            continue
+        sf, ef = frame_pairs[i]
+        dur = (ef - sf) / fps
+        if dur <= max_gap_seconds and _same_spot(prev_box, next_box):
+            by_idx[i] = prev_box
+
+    # Stabilize consecutive agreeing tuple boxes to their median so scene cuts
+    # do not shift the webcam crop by a few pixels.
+    idx_list = sorted(by_idx.keys())
+    i = 0
+    while i < len(idx_list):
+        run = [idx_list[i]]
+        j = i + 1
+        while j < len(idx_list) and _same_spot(by_idx[idx_list[j - 1]], by_idx[idx_list[j]]):
+            run.append(idx_list[j])
+            j += 1
+        if len(run) > 1 and all(not isinstance(by_idx[k], dict) for k in run):
+            arr = np.array([_box_tuple(by_idx[k]) for k in run], dtype=float)
+            med = tuple(int(round(v)) for v in np.median(arr, axis=0))
+            for k in run:
+                by_idx[k] = med
+        i = j
+
+    return {_key(idx): val for idx, val in by_idx.items()}
+
+
+def _unpack_spec(box, screen_box=None):
+    """Accept either a bare (x, y, w, h) camera box or a dict
+    ``{"camera": (cx, cy, cw, ch), "screen": (sx, sy, sw, sh)}``."""
+    if isinstance(box, dict):
+        cam = box.get("camera") or box.get("box")
+        scr = screen_box if screen_box is not None else box.get("screen")
+        return cam, scr
+    return box, screen_box
+
+
+def cam_screen_geometry(orig_w, orig_h, out_w, out_h, box, camera_ratio=None,
+                        screen_box=None, caption_band_ratio=None):
+    """Compute exact, distortion-free geometry for the 9:16 Camera + Screen layout:
+      - Streamer camera on TOP
+      - Central subtitle band in the middle (seam)
+      - Game / screen on BOTTOM
+
+    Preserves the aspect ratio of both source regions without stretching faces,
+    HUD or interface elements, and keeps the screen band above ``MIN_SCREEN_RATIO``
+    so the central subtitle band never makes the screen illegible.
+    """
+    cam_box, screen_box = _unpack_spec(box, screen_box)
+    box_w = max(2, int(round(cam_box[2])))
+    box_h = max(2, int(round(cam_box[3])))
 
     if camera_ratio is not None:
         cam_h = int(out_h * camera_ratio)
     else:
         cam_h = int(round(out_w * box_h / float(box_w)))
     cam_h = min(cam_h, int(out_h * MAX_CAMERA_RATIO))
-    cam_h -= cam_h % 2
+    cam_h = max(2, cam_h - (cam_h % 2))
 
-    screen_h = int(round(out_w * orig_h / float(orig_w)))
-    screen_h -= screen_h % 2
-    screen_h = max(2, min(screen_h, out_h - cam_h - 2))
-
-    # Widen (or heighten) the crop to the band's aspect so the scale below is
-    # uniform. Clamped to the frame, so an inset hard against an edge simply
-    # keeps whatever it can reach.
+    # Widen (or heighten) the camera crop in source coordinates so its aspect
+    # matches out_w / cam_h. If clamping against the source frame stops it from
+    # reaching the target aspect, adjust the other dimension so the scale stays
+    # 100% uniform (never stretching the face).
     target_aspect = out_w / float(cam_h)
-    x, y, w, h = box
+    x, y, w, h = [int(round(v)) for v in cam_box[:4]]
     if w / float(h) < target_aspect:
         want_w = min(orig_w, int(round(h * target_aspect)))
         x = int(round(x + w / 2.0 - want_w / 2.0))
@@ -434,22 +649,150 @@ def inset_filtergraph(orig_w, orig_h, out_w, out_h, box, camera_ratio=None):
     x = max(0, min(x, orig_w - w))
     y = max(0, min(y, orig_h - h))
 
-    w -= w % 2
-    h -= h % 2
-    x -= x % 2
-    y -= y % 2
+    w = max(2, w - (w % 2))
+    h = max(2, h - (h % 2))
+    x = max(0, min(x - (x % 2), orig_w - w))
+    y = max(0, min(y - (y % 2), orig_h - h))
 
-    filler_h = out_h - screen_h - cam_h
+    # If source clamping still left an aspect mismatch (>2%), adjust cam_h to
+    # match the actual clamped source crop aspect so faces never stretch.
+    actual_aspect = w / float(h)
+    if abs(actual_aspect - target_aspect) > 0.02:
+        adjusted_cam_h = int(round(out_w / actual_aspect))
+        adjusted_cam_h -= adjusted_cam_h % 2
+        if 2 <= adjusted_cam_h <= int(out_h * MAX_CAMERA_RATIO):
+            cam_h = adjusted_cam_h
+        else:
+            h = max(2, min(orig_h, int(round(w / target_aspect))))
+            h -= h % 2
+            y = max(0, min(y, orig_h - h))
+            y -= y % 2
+
+    # Screen region: full source frame by default, or user-selected sub-region.
+    crop_screen = False
+    if screen_box is not None:
+        sx, sy, sw, sh = [int(round(v)) for v in screen_box[:4]]
+        sw = max(2, min(sw, orig_w))
+        sh = max(2, min(sh, orig_h))
+        sx = max(0, min(sx, orig_w - sw))
+        sy = max(0, min(sy, orig_h - sh))
+        sw = max(2, sw - (sw % 2))
+        sh = max(2, sh - (sh % 2))
+        sx -= sx % 2
+        sy -= sy % 2
+        crop_screen = (sx != 0 or sy != 0 or sw != orig_w or sh != orig_h)
+    else:
+        sx, sy, sw, sh = 0, 0, orig_w, orig_h
+
+    screen_h = int(round(out_w * sh / float(sw)))
+    screen_h -= screen_h % 2
+    min_screen_h = int(out_h * MIN_SCREEN_RATIO)
+    min_screen_h -= min_screen_h % 2
+
+    # Ensure screen is never squeezed below readability or past available height.
+    max_screen_h = max(2, out_h - cam_h - 2)
+    if screen_h > max_screen_h:
+        screen_h = max_screen_h - (max_screen_h % 2)
+        if crop_screen:
+            # Adjust source height to preserve aspect ratio without stretching.
+            sh = max(2, min(orig_h, int(round(sw * screen_h / float(out_w)))))
+            sh -= sh % 2
+            sy = max(0, min(sy, orig_h - sh))
+            sy -= sy % 2
+    elif crop_screen and screen_h < min_screen_h and min_screen_h <= max_screen_h:
+        # Widen/heighten crop to give the screen at least min_screen_h without stretch.
+        want_sh = min(orig_h, int(round(sw * min_screen_h / float(out_w))))
+        want_sh -= want_sh % 2
+        if want_sh > sh:
+            sy = max(0, min(int(round(sy + sh / 2.0 - want_sh / 2.0)), orig_h - want_sh))
+            sy -= sy % 2
+            sh = want_sh
+            screen_h = int(round(out_w * sh / float(sw)))
+            screen_h -= screen_h % 2
+
+    screen_h = max(2, min(screen_h, out_h - cam_h - 2))
+    screen_h -= screen_h % 2
+
+    leftover = max(0, out_h - cam_h - screen_h)
+    want_band_ratio = (DEFAULT_CAPTION_BAND_RATIO
+                       if caption_band_ratio is None else float(caption_band_ratio))
+    want_band_h = max(0, int(round(out_h * want_band_ratio)))
+    want_band_h -= want_band_h % 2
+    # Reserve the central caption band from the leftover vertical space so it
+    # never shrinks the screen or camera, while leaving room for top/bottom safe margins.
+    band_h = min(want_band_h, leftover)
+    band_h -= band_h % 2
+
+    outer_filler = max(0, leftover - band_h)
+    # Bias outer filler so top clears status bar (~35% of outer filler) and
+    # bottom clears platform caption/account chrome (~65% of outer filler).
+    cam_y = int(round(outer_filler * 0.35))
+    cam_y -= cam_y % 2
+    screen_y = cam_y + cam_h + band_h
+    screen_y -= screen_y % 2
+    if screen_y + screen_h > out_h:
+        screen_y = max(cam_y + cam_h, out_h - screen_h)
+        screen_y -= screen_y % 2
+
+    seam_top = cam_y + cam_h
+    seam_bottom = screen_y
+    seam_centre = (seam_top + seam_bottom) / 2.0 / float(out_h)
+
+    return {
+        "cam_src": (x, y, w, h),
+        "cam_dst": (0, cam_y, out_w, cam_h),
+        "screen_src": (sx, sy, sw, sh),
+        "screen_dst": (0, screen_y, out_w, screen_h),
+        "crop_screen": crop_screen,
+        "caption_band_px": (seam_top, seam_bottom),
+        "caption_band_y": (seam_top, seam_bottom),
+        "seam_y_fraction": round(seam_centre, 4),
+        "content_band": (
+            round(cam_y / float(out_h), 3),
+            round((screen_y + screen_h) / float(out_h), 3),
+        ),
+    }
+
+
+def inset_filtergraph(orig_w, orig_h, out_w, out_h, box, camera_ratio=None,
+                      screen_box=None, caption_band_ratio=None):
+    """Streamer camera on top, central caption band, game/screen below in 9:16.
+
+    The screen keeps its whole width by default (or the selected ``screen_box``
+    region when specified), so a game HUD, trailer detail or desktop puts what
+    matters in full view without horizontal cropping. The camera inset is placed
+    at the top at its own aspect ratio, with a central band between camera and
+    screen where burned subtitles sit without covering either the face or the
+    game/screen content.
+    """
+    geom = cam_screen_geometry(
+        orig_w, orig_h, out_w, out_h, box,
+        camera_ratio=camera_ratio,
+        screen_box=screen_box,
+        caption_band_ratio=caption_band_ratio,
+    )
+    x, y, w, h = geom["cam_src"]
+    _cx, cam_y, _cw, cam_h = geom["cam_dst"]
+    sx, sy, sw, sh = geom["screen_src"]
+    _sx, screen_y, _sw, screen_h = geom["screen_dst"]
+
+    if geom["crop_screen"]:
+        screen_chain = f"crop=w={sw}:h={sh}:x={sx}:y={sy},scale={out_w}:{screen_h}"
+    else:
+        screen_chain = f"scale={out_w}:{screen_h}"
 
     return (
         f"[0:v]split=3[bga][sa][ca];"
-        # Blurred backdrop so the leftover strip is not a black bar. Scaled by
-        # HEIGHT: scaling a 16:9 source to 1080 wide gives 608 tall, and there
-        # is no 1920-tall crop to take out of that.
+        # Blurred backdrop so the leftover strips and central caption band are
+        # not black bars. Scaled by HEIGHT: scaling a 16:9 source to 1080 wide
+        # gives 608 tall, and there is no 1920-tall crop to take out of that.
         f"[bga]{blurred_backdrop(out_w, out_h, 14)}[bg];"
-        f"[sa]scale={out_w}:{screen_h}[screen];"
+        f"[sa]{screen_chain}[screen];"
         f"[ca]crop=w={w}:h={h}:x={x}:y={y},scale={out_w}:{cam_h}[cam];"
-        f"[bg][screen]overlay=x=0:y={filler_h // 2}[withscreen];"
-        f"[withscreen][cam]overlay=x=0:y={filler_h // 2 + screen_h},"
+        f"[bg][cam]overlay=x=0:y={cam_y}[withcam];"
+        f"[withcam][screen]overlay=x=0:y={screen_y},"
         f"setsar=1[v]"
     )
+
+
+cam_screen_filtergraph = inset_filtergraph

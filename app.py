@@ -5212,6 +5212,9 @@ def _reject_short_source(duration: float):
 LAYOUT_ENV = {
     "split": "SPLIT_LAYOUT",          # two speakers stacked
     "screencast": "SCREENCAST_LAYOUT",  # slides/screen share over the speaker
+    "cam_screen": "CAM_SCREEN_LAYOUT",  # streamer camera on top + central captions + game/screen below
+    "inset": "CAM_SCREEN_LAYOUT",       # alias for cam_screen
+    "panel": "PANEL_LAYOUT",          # 3-4 speakers in a 2x2 grid
     "speaker_cut": "SPEAKER_CUT",     # hard cuts to whoever is talking
     "punch_in": "PUNCH_IN",           # small push on the clip's beats
 }
@@ -5460,6 +5463,16 @@ async def process_endpoint(
     max_minutes: Optional[str] = Form(None),
     source_start: Optional[str] = Form(None),
     source_end: Optional[str] = Form(None),
+    live: Optional[str] = Form(None),
+    chunk_minutes: Optional[str] = Form(None),
+    overlap_seconds: Optional[str] = Form(None),
+    min_score: Optional[str] = Form(None),
+    min_window_score: Optional[str] = Form(None),
+    min_words_per_min: Optional[str] = Form(None),
+    max_clips_per_chunk: Optional[str] = Form(None),
+    max_total_clips: Optional[str] = Form(None),
+    max_duration_minutes: Optional[str] = Form(None),
+    force_new: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
     if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
@@ -5471,6 +5484,7 @@ async def process_endpoint(
 
     ack_flag = str(acknowledged).lower() in ("1", "true", "yes")
     force_low = str(force_low_quality).lower() in ("1", "true", "yes")
+    body = {}
 
     # Handle JSON body manually for URL payload
     content_type = request.headers.get("content-type", "")
@@ -5494,6 +5508,40 @@ async def process_endpoint(
         max_minutes = body.get("max_minutes")
         source_start = body.get("source_start")
         source_end = body.get("source_end")
+        live = body.get("live")
+        chunk_minutes = body.get("chunk_minutes")
+        overlap_seconds = body.get("overlap_seconds")
+        min_score = body.get("min_score")
+        min_window_score = body.get("min_window_score")
+        min_words_per_min = body.get("min_words_per_min")
+        max_clips_per_chunk = body.get("max_clips_per_chunk")
+        max_total_clips = body.get("max_total_clips")
+        max_duration_minutes = body.get("max_duration_minutes")
+        force_new = body.get("force_new")
+
+    if str(live).lower() in ("1", "true", "yes"):
+        return await _start_live_session_from_payload(request, {
+            "url": url,
+            "acknowledged": ack_flag,
+            "chunk_minutes": chunk_minutes,
+            "overlap_seconds": overlap_seconds,
+            "min_score": min_score,
+            "min_window_score": min_window_score,
+            "min_words_per_min": min_words_per_min,
+            "max_clips_per_chunk": max_clips_per_chunk or target_clips,
+            "max_total_clips": max_total_clips,
+            "max_duration_minutes": max_duration_minutes or max_minutes,
+            "captions": captions,
+            "auto_hook": auto_hook,
+            "auto_hook_style": auto_hook_style,
+            "layouts": layouts,
+            "output_format": output_format,
+            "clip_min_seconds": clip_min_seconds,
+            "clip_max_seconds": clip_max_seconds,
+            "webhook_url": webhook_url,
+            "webhook_secret": webhook_secret,
+            "force_new": force_new,
+        })
 
     # Normalize output format (auto = keep pipeline default).
     if output_format not in ("vertical", "horizontal", "square"):
@@ -5924,7 +5972,9 @@ async def get_status(job_id: str, request: Request):
 
     await _assert_job_owner(request, job)
     _logs_view = _visible_logs_timed(job['logs'])
-    return {
+    import live_stream
+    live_sess = live_stream.get_session(job_id)
+    resp = {
         "status": _presented_status(job_id, job),
         "logs": _logs_view[0],
         # When each line arrived (epoch seconds, parallel to "logs"), or None.
@@ -5935,6 +5985,289 @@ async def get_status(job_id: str, request: Request):
         # Set when only the first part of the source was clipped (quota wall
         # offer), so the dashboard can say so next to the clips.
         "partial": job.get('partial'),
+    }
+    if live_sess is not None:
+        resp["live"] = live_sess.snapshot()
+    return resp
+
+
+# --- Real-time Live Stream Monitoring & Clipping API --------------------------
+async def _validate_live_url(url: str) -> str:
+    """Validate that ``url`` is a public HTTP(S) URL suitable for live stream
+    probing/capture (including YouTube ``/@handle/live`` channel links)."""
+    from security_utils import assert_public_url, UnsafeURLError
+    from yt_clients import youtube_non_video_reason
+    import live_stream
+
+    raw = str(url or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Must provide a live stream URL.")
+    norm = live_stream.normalize_live_candidate_url(raw)
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, assert_public_url, norm)
+    except UnsafeURLError as e:
+        raise HTTPException(status_code=400, detail=f"This URL can't be processed: {e}")
+
+    # Allow YouTube `/@handle/live` and `/channel/.../live` shortcuts for live streams
+    from urllib.parse import urlparse
+    parsed = urlparse(norm)
+    host = (parsed.hostname or "").lower()
+    if host == "youtube.com" or host.endswith(".youtube.com"):
+        segs = [s for s in (parsed.path or "").split("/") if s]
+        is_channel_live = (
+            (len(segs) == 2 and segs[0].startswith("@") and segs[1] == "live")
+            or (len(segs) == 3 and segs[0] in ("channel", "c", "user") and segs[2] == "live")
+        )
+        if not is_channel_live:
+            reason = youtube_non_video_reason(norm)
+            if reason:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"This link is {reason}. Paste the link of the live stream or channel /live page.",
+                )
+    return norm
+
+
+def _bool_param(val, default: bool) -> bool:
+    if val is None or val == "":
+        return default
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() not in ("0", "false", "no", "off")
+
+
+async def _start_live_session_from_payload(request: Request, payload: dict):
+    import live_stream
+    from security_utils import assert_public_url, UnsafeURLError
+
+    api_key = await resolve_gemini(request)
+    if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
+        raise gemini_missing_error()
+
+    url = payload.get("url")
+    if not url:
+        raise HTTPException(status_code=400, detail="Must provide URL for live stream.")
+    if DISABLE_YOUTUBE_URL:
+        raise HTTPException(status_code=403, detail="URL ingest is disabled on this deployment.")
+    if not _bool_param(payload.get("acknowledged"), False):
+        raise HTTPException(
+            status_code=400,
+            detail="You must confirm you own the content or have rights to process it.",
+        )
+
+    norm_url = await _validate_live_url(url)
+
+    webhook_url = payload.get("webhook_url")
+    webhook_secret = payload.get("webhook_secret")
+    if webhook_url:
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, assert_public_url, webhook_url)
+        except UnsafeURLError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid webhook_url: {e}")
+
+    owner = await _owner_id(request)
+    force_new = _bool_param(payload.get("force_new"), False)
+    if not force_new:
+        existing = live_stream.find_active_session_by_url(norm_url, owner_id=owner)
+        if existing is not None:
+            return {
+                "job_id": existing.job_id,
+                "status": _presented_status(existing.job_id, jobs.get(existing.job_id, {"status": "processing"})),
+                "already_active": True,
+                "live": existing.snapshot(),
+            }
+
+    raw_layouts = payload.get("layouts")
+    if isinstance(raw_layouts, str):
+        layouts = [p.strip() for p in raw_layouts.split(",") if p.strip()] or ["auto"]
+    elif isinstance(raw_layouts, list) and raw_layouts:
+        layouts = [str(p).strip() for p in raw_layouts if str(p).strip()]
+    else:
+        layouts = ["auto"]
+
+    def _num(key, default):
+        v = payload.get(key)
+        if v in (None, ""):
+            return default
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"{key} must be a number")
+
+    cfg = live_stream.LiveConfig(
+        url=norm_url,
+        chunk_minutes=_num("chunk_minutes", 10.0),
+        overlap_seconds=_num("overlap_seconds", 30.0),
+        min_score=_num("min_score", 75.0),
+        min_window_score=_num("min_window_score", None),
+        min_words_per_min=_num("min_words_per_min", 20.0),
+        max_clips_per_chunk=int(_num("max_clips_per_chunk", 2)),
+        max_total_clips=int(_num("max_total_clips", 30)),
+        max_duration_minutes=int(_num("max_duration_minutes", 360)),
+        captions=_bool_param(payload.get("captions"), True),
+        auto_hook=_bool_param(payload.get("auto_hook"), True),
+        auto_hook_style=str(payload.get("auto_hook_style") or "pill"),
+        layouts=layouts,
+        output_format=str(payload.get("output_format") or "vertical"),
+        clip_min_seconds=_num("clip_min_seconds", 30.0),
+        clip_max_seconds=_num("clip_max_seconds", 60.0),
+        webhook_url=webhook_url,
+        webhook_secret=webhook_secret,
+    ).normalized()
+
+    job_id = str(uuid.uuid4())
+    job_output_dir = os.path.join(OUTPUT_DIR, job_id)
+    os.makedirs(job_output_dir, exist_ok=True)
+
+    env = child_env()
+    if api_key:
+        env["GEMINI_API_KEY"] = api_key
+    else:
+        env.pop("GEMINI_API_KEY", None)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.update(layout_env(cfg.layouts))
+
+    api_base = os.environ.get("PUBLIC_API_URL", "").rstrip("/") or str(request.base_url).rstrip("/")
+
+    if owner is not None:
+        try:
+            with open(os.path.join(job_output_dir, ".owner"), "w") as f:
+                f.write(str(owner))
+        except Exception as e:
+            print(f"⚠️ Could not persist job owner for live session {job_id}: {e}")
+
+    jobs[job_id] = {
+        "status": "processing",
+        "logs": _TimedLog([f"🔴 Live session {job_id} started for {norm_url}."]),
+        "cmd": [sys.executable, "-u", "main.py", "-u", norm_url],
+        "env": env,
+        "output_dir": job_output_dir,
+        "user_id": owner,
+        "reservation_id": None,
+        "watermark": False,
+        "partial": None,
+        "webhook_url": webhook_url,
+        "webhook_secret": webhook_secret,
+        "base_url": api_base,
+        "via_api_key": request_uses_api_key(request),
+        "result": {"clips": []},
+        "ready_files": {},
+        "live_session": True,
+        "submitted_at": _arrival_now(),
+    }
+
+    async def _on_live_finished(jid: str, _snap: dict):
+        if jobs.get(jid, {}).get("webhook_url"):
+            with contextlib.suppress(Exception):
+                await _notify_job_webhook(jid)
+
+    session = live_stream.LiveSession(
+        job_id=job_id,
+        output_dir=job_output_dir,
+        config=cfg,
+        base_env=env,
+        job_record=jobs[job_id],
+        owner_id=owner,
+        on_session_finished=_on_live_finished,
+    )
+    live_stream.register_session(session)
+    session.start()
+
+    return {
+        "job_id": job_id,
+        "status": "processing",
+        "already_active": False,
+        "live": session.snapshot(),
+    }
+
+
+@app.get("/api/live/probe")
+async def probe_live_get(url: str, request: Request):
+    await require_managed_entitlement(request)
+    norm_url = await _validate_live_url(url)
+    import live_stream
+    try:
+        info = await asyncio.to_thread(live_stream.probe_live_stream, norm_url)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # Never expose internal signed CDN stream URLs in public probe responses
+    info.pop("stream_url", None)
+    info.pop("audio_stream_url", None)
+    return info
+
+
+@app.post("/api/live/probe")
+async def probe_live_post(request: Request):
+    await require_managed_entitlement(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    url = (body or {}).get("url") or ""
+    return await probe_live_get(url, request)
+
+
+@app.post("/api/live/start")
+async def start_live_endpoint(request: Request):
+    await require_managed_entitlement(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
+    return await _start_live_session_from_payload(request, body)
+
+
+@app.get("/api/live")
+async def list_live_sessions_endpoint(request: Request, active_only: bool = False):
+    await require_managed_entitlement(request)
+    import live_stream
+    owner = await _owner_id(request)
+    return {"sessions": live_stream.list_sessions(owner_id=owner, active_only=active_only)}
+
+
+@app.get("/api/live/{job_id}")
+async def get_live_session_endpoint(job_id: str, request: Request):
+    _require_safe_id(job_id, "job_id")
+    import live_stream
+    sess = live_stream.get_session(job_id)
+    job = jobs.get(job_id)
+    if sess is None and job is None:
+        raise HTTPException(status_code=404, detail="Live session not found")
+    if job is not None:
+        await _assert_job_owner(request, job)
+    result = _with_download_urls((job or {}).get("result")) or {"clips": []}
+    return {
+        "job_id": job_id,
+        "status": _presented_status(job_id, job) if job else (sess.state if sess else "unknown"),
+        "live": sess.snapshot() if sess else None,
+        "result": result,
+        "clips": result.get("clips") or [],
+    }
+
+
+@app.post("/api/live/{job_id}/stop")
+async def stop_live_session_endpoint(job_id: str, request: Request):
+    _require_safe_id(job_id, "job_id")
+    import live_stream
+    sess = live_stream.get_session(job_id)
+    job = jobs.get(job_id)
+    if sess is None:
+        raise HTTPException(status_code=404, detail="Live session not found")
+    if job is not None:
+        await _assert_job_owner(request, job)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    process_partial = _bool_param((body or {}).get("process_partial_chunk"), True)
+    sess.request_stop(process_partial=process_partial)
+    return {
+        "job_id": job_id,
+        "status": sess.state,
+        "stop_requested": True,
+        "live": sess.snapshot(),
     }
 
 
@@ -6727,7 +7060,14 @@ class RerenderRequest(BaseModel):
 # Manual framing -> reframe-engine strategy. 'full' shows the whole source
 # frame (WIDE: no side-cropping, blurred filler bands); 'track' forces the
 # subject-tracking crop. Anything non-auto needs the retained source video.
-_FRAMING_STRATEGIES = {"auto": None, "full": "WIDE", "track": "TRACK"}
+_FRAMING_STRATEGIES = {
+    "auto": None,
+    "full": "WIDE",
+    "track": "TRACK",
+    "cam_screen": "INSET",
+    "inset": "INSET",
+    "panel": "PANEL",
+}
 
 
 # One lock per job (same pattern as _restore_locks): rerenders on the same job
@@ -7142,12 +7482,26 @@ async def reframe_clip(req: ReframeRequest, request: Request):
         try:
             idx = int(key)
             if isinstance(value, dict):
-                def _half(h):
-                    if isinstance(h, dict):
-                        return {"x": _fraction(h["x"]), "y": _fraction(h.get("y", 0.5))}
-                    return {"x": _fraction(h), "y": 0.5}
-                overrides[idx] = {"top": _half(value["top"]),
-                                  "bottom": _half(value["bottom"])}
+                if "camera" in value:
+                    def _rect(r, def_w=0.24, def_h=0.24):
+                        if isinstance(r, dict):
+                            out = {"x": _fraction(r["x"]), "y": _fraction(r.get("y", 0.5))}
+                            if "w" in r and "h" in r:
+                                out["w"] = max(0.02, _fraction(r["w"]))
+                                out["h"] = max(0.02, _fraction(r["h"]))
+                            return out
+                        return {"x": _fraction(r), "y": 0.5, "w": def_w, "h": def_h}
+                    entry = {"camera": _rect(value["camera"])}
+                    if value.get("screen") is not None:
+                        entry["screen"] = _rect(value["screen"], def_w=1.0, def_h=1.0)
+                    overrides[idx] = entry
+                else:
+                    def _half(h):
+                        if isinstance(h, dict):
+                            return {"x": _fraction(h["x"]), "y": _fraction(h.get("y", 0.5))}
+                        return {"x": _fraction(h), "y": 0.5}
+                    overrides[idx] = {"top": _half(value["top"]),
+                                      "bottom": _half(value["bottom"])}
             else:
                 overrides[idx] = _fraction(value)
         except (KeyError, TypeError, ValueError):
@@ -7272,6 +7626,72 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
             await _metering.release_reservation(reservation_id)
         print(f"Reframe Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class ClipReviewRequest(BaseModel):
+    job_id: str
+    clip_index: int
+    status: str  # "approved" | "rejected" | "pending_review"
+    notes: str = ""
+
+
+@app.post("/api/clip/review")
+async def review_clip(req: ClipReviewRequest, request: Request):
+    """Record explicit human visual and editorial approval/rejection on a clip.
+
+    Container resolution (1080x1920) and automatic predicted_score never
+    substitute for human approval before publishing.
+    """
+    await _ensure_job_files(req.job_id, request)
+    if req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[req.job_id]
+    await _assert_job_owner(request, job)
+
+    status = str(req.status or "").strip().lower()
+    if status not in ("approved", "rejected", "pending_review"):
+        raise HTTPException(
+            status_code=400,
+            detail="status must be 'approved', 'rejected', or 'pending_review'",
+        )
+
+    lock = _rerender_locks.setdefault(req.job_id, asyncio.Lock())
+    async with lock:
+        output_dir = os.path.join(OUTPUT_DIR, req.job_id)
+        json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+        if not json_files:
+            raise HTTPException(status_code=404, detail="Metadata not found")
+        with open(json_files[0], "r") as f:
+            data = json.load(f)
+        clips = data.get("shorts", [])
+        if req.clip_index < 0 or req.clip_index >= len(clips):
+            raise HTTPException(status_code=404, detail="Clip not found")
+        clip = clips[req.clip_index]
+
+        import quality_gate
+        gate = quality_gate.evaluate_clip_render(
+            clip=clip,
+            layout_ranges_list=clip.get("layout_ranges"),
+            transcript=data.get("transcript"),
+            source_title=data.get("video_title") or data.get("title"),
+        )
+        gate["review_status"] = status
+        gate["needs_review"] = status != "approved"
+        gate["review_notes"] = str(req.notes or "").strip()
+        clip["quality_gate"] = gate
+        data["shorts"] = clips
+        write_json_atomic(json_files[0], data, indent=2)
+
+        mem_clips = (job.get("result") or {}).get("clips") or []
+        if req.clip_index < len(mem_clips):
+            mem_clips[req.clip_index]["quality_gate"] = gate
+
+        return {
+            "success": True,
+            "job_id": req.job_id,
+            "clip_index": req.clip_index,
+            "quality_gate": gate,
+        }
 
 
 # --- Remotion Render Proxy ---
@@ -7676,31 +8096,40 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
 
     output_filename = await _deliver(request, req.job_id, output_filename)
 
-    # 3. Update Result and Metadata
-    # Update InMemory Jobs
-    if req.clip_index < len(job['result']['clips']):
-         job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
-    
-    # Update Metadata on Disk (Persistence)
-    try:
-        if req.clip_index < len(clips):
-            clips[req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
-            # The look (and edited words) the hook / edit / recut paths burn
-            # again when they put captions back (_reapply_captions, #82).
-            clips[req.clip_index]['caption_style'] = caption_style
-            if caption_words:
-                clips[req.clip_index]['caption_words'] = caption_words
-            else:
-                clips[req.clip_index].pop('caption_words', None)
-            # Update the main data structure
-            data['shorts'] = clips
-            
-            # Write back
-            write_json_atomic(json_files[0], data, indent=4)
-            print(f"✅ Metadata updated with subtitled video for clip {req.clip_index}")
-    except Exception as e:
-        print(f"⚠️ Failed to update metadata.json: {e}")
-        # Non-critical, but good for persistence
+    # 3. Update Result and Metadata (with live-session lock if active so a
+    # concurrent live chunk merge cannot be overwritten by an older snapshot).
+    import live_stream
+    live_sess = live_stream.get_session(req.job_id)
+    lock_ctx = live_sess.metadata_lock if live_sess is not None else contextlib.nullcontext()
+    with lock_ctx:
+        if (job.get('result') and isinstance(job['result'].get('clips'), list)
+                and req.clip_index < len(job['result']['clips'])):
+            job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
+
+        # Update Metadata on Disk (Persistence)
+        try:
+            if live_sess is not None and os.path.exists(json_files[0]):
+                with open(json_files[0], 'r') as f:
+                    data = json.load(f)
+                clips = data.get('shorts', clips)
+            if req.clip_index < len(clips):
+                clips[req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
+                # The look (and edited words) the hook / edit / recut paths burn
+                # again when they put captions back (_reapply_captions, #82).
+                clips[req.clip_index]['caption_style'] = caption_style
+                if caption_words:
+                    clips[req.clip_index]['caption_words'] = caption_words
+                else:
+                    clips[req.clip_index].pop('caption_words', None)
+                # Update the main data structure
+                data['shorts'] = clips
+
+                # Write back
+                write_json_atomic(json_files[0], data, indent=4)
+                print(f"✅ Metadata updated with subtitled video for clip {req.clip_index}")
+        except Exception as e:
+            print(f"⚠️ Failed to update metadata.json: {e}")
+            # Non-critical, but good for persistence
 
     _archive_clip_edit_bg(req.job_id, req.clip_index, output_filename)
 

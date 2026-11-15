@@ -1,10 +1,14 @@
 from reframe_v2 import (
     DELIVERY_MIN_WIDTH,
+    apply_crop_overrides,
     concat_list_content,
     dedupe_sendcmd_lines,
     delivery_size,
+    full_width_content_height,
     general_filtergraph,
+    safe_general_content_height,
     scene_frame_ranges,
+    smooth_layout_transitions,
     source_already_fits,
 )
 
@@ -171,3 +175,44 @@ class TestVerticalSource:
             graph = general_filtergraph(1080, 1920, orig_w=1080, orig_h=orig_h)
             h = int(graph.split("[fga]scale=-2:")[1].split(",")[0])
             assert h % 2 == 0, (orig_h, h)
+
+
+class TestBorderSafeGeneralAndTransitions:
+    def test_safe_general_height_prevents_cutting_edge_faces(self):
+        # Default 0.42 ratio on 1920x1080 trims ~236px off each side.
+        # A speaker seated near the left edge (x=50, w=180) would be cut in half.
+        default_h = safe_general_content_height(1920, 1080, 1080, 1920)
+        edge_face_h = safe_general_content_height(
+            1920, 1080, 1080, 1920,
+            face_boxes=[[50, 300, 180, 180], [900, 300, 180, 180], [1690, 300, 180, 180]],
+        )
+        full_h = full_width_content_height(1920, 1080, 1080)
+        assert edge_face_h < default_h
+        assert edge_face_h >= full_h
+
+    def test_smooth_layout_transitions_bridges_short_flicker(self):
+        # Middle scene is 30 frames (1.0s at 30fps) sandwiched between two INSET scenes
+        bounds = [(0, 120), (120, 150), (150, 300)]
+        insets = {0: (24, 24, 350, 196), 150: (24, 24, 350, 196)}
+        smoothed = smooth_layout_transitions(
+            ["INSET", "TRACK", "INSET"], bounds, fps=30.0, insets=insets
+        )
+        assert smoothed == ["INSET", "INSET", "INSET"]
+        assert 120 in insets
+
+    def test_manual_cam_screen_override_writes_inset_and_sets_strategy(self):
+        insets = {}
+        splits = {0: ((400, 400), (1400, 400))}
+        xs, strategies = apply_crop_overrides(
+            [None] * 60, ["SPLIT"], [(0, 60)],
+            {"0": {
+                "camera": {"x": 0.02, "y": 0.03, "w": 0.20, "h": 0.20},
+                "screen": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+            }},
+            crop_w=608, orig_w=1920, orig_h=1080, splits=splits, insets=insets,
+        )
+        assert strategies == ["INSET"]
+        assert 0 not in splits
+        assert 0 in insets
+        assert insets[0]["camera"] == (38, 32, 384, 216)
+        assert insets[0]["screen"] == (0, 0, 1920, 1080)

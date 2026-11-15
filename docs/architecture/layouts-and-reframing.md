@@ -3,12 +3,13 @@
 ## Choosing the layout (`layout_picker.py`, `app.py:layout_env`)
 
 `POST /api/process` accepts `layouts`: a JSON list or comma-separated string of
-`auto`, `split`, `screencast`, `speaker_cut`, `punch_in` and `none`. Each name
-turns on its env variable for **that** job (`app.py:layout_env`); `none` turns
-the picker off even when the deployment runs with `AUTO_LAYOUT=1` (plain crop
-and nothing else). Without `layouts` the deployment env decides. The dashboard
-exposes it under advanced options ("vertical layout": auto / split / screencast
-/ none, `MediaInput.jsx`, remembered in `localStorage.os_layout`).
+`auto`, `split`, `screencast`, `cam_screen`, `inset`, `panel`, `speaker_cut`,
+`punch_in` and `none`. Each name turns on its env variable for **that** job
+(`app.py:layout_env`); `none` turns the picker off even when the deployment runs
+with `AUTO_LAYOUT=1` (plain crop and nothing else). Without `layouts` the
+deployment env decides. The dashboard exposes it under advanced options
+("vertical layout": auto / split / screencast / none, `MediaInput.jsx`,
+remembered in `localStorage.os_layout`).
 
 `auto` enables `layout_picker.py`: **one** Gemini call per source video (not per
 clip) choosing between `none` / `screencast` / `split`. On a hand-labelled
@@ -96,22 +97,36 @@ width, so an explicit GENERAL override on a portrait clip cannot shrink it.
 
 - **TRACK** (single subject): MediaPipe face detection + YOLOv8 fallback with
   "Heavy Tripod" stabilization.
-- **GENERAL** (groups/landscapes): blurred-background layout preserving full width.
+- **GENERAL** (groups/landscapes): blurred-background layout preserving full
+  width. When multiple faces sit near the horizontal borders of a group/podcast
+  shot, `reframe_v2.safe_general_content_height()` automatically lowers the
+  foreground height ratio toward the full-width aspect so edge participants are
+  never sliced at the canvas borders.
 - **SPLIT** (two-shot conversation, `split_layout.py`, `SPLIT_LAYOUT=1`): both
   speakers stacked in half-frames. v2 engine only; a fallback to the v1 loop
   silently renders GENERAL. It upgrades scenes the classifier already sent to
   GENERAL, never TRACK ones, and needs both faces visible **in the same frame**
   for at least half the sampled frames (that separates a real two-shot from
-  shot/reverse-shot, where stacking would show the same person twice).
-  `SPLIT_TIGHTNESS` (default 0.8) trades a little upscale for keeping the other
-  speaker out of each half. Captions on a SPLIT stretch sit on the seam between
-  the halves (`{\an5}` per word event in `subtitles.generate_ass`); the render
-  records stacked stretches in a `<clip>.layout.json` sidecar (`layout_ranges.py`)
-  and every metadata writer copies it into the clip's `layout_ranges`, so
-  `/api/subtitle` finds it after a restyle too. The fast rerender (cut without
-  reframe) carries the ranges through the new cut (`layout_ranges.remap`, in
-  `recut.perform_recut`). Only the ASS path can do this; SRT burns keep one
-  alignment for the whole file.
+  shot/reverse-shot, where stacking would show the same person twice). Scenes
+  with **3 or more separated participant faces** are explicitly rejected by
+  `_two_largest()` so a 3+ person podcast mosaic is never forced into a 2-way
+  SPLIT (which duplicated the middle speaker and cut off the 3rd speaker).
+  `SPLIT_TIGHTNESS` (default 0.8) plus `neighbour_gap` and `neighbour_x`
+  clamping/shifting guarantee that the top and bottom crops never overlap or
+  include the neighbour's face centre. Captions on a SPLIT stretch sit on the
+  seam between the halves (`{\an5}` per word event in `subtitles.generate_ass`);
+  the render records stacked stretches in a `<clip>.layout.json` sidecar
+  (`layout_ranges.py`) and every metadata writer copies it into the clip's
+  `layout_ranges`, so `/api/subtitle` finds it after a restyle too. The fast
+  rerender (cut without reframe) carries the ranges through the new cut
+  (`layout_ranges.remap`, in `recut.perform_recut`). Only the ASS path can do
+  this; SRT burns keep one alignment for the whole file.
+- **PANEL** (multi-panel podcast / grid mosaic, `panel_layout.py`,
+  `PANEL_LAYOUT=1`): detects 2, 3 or 4 side-by-side / grid panels separated by
+  borders (`detect_panels`), verifies each panel contains a real face and has no
+  duplicate panels (`has_duplicate_panels`), and stacks them into a 9:16 layout
+  (1+2 or 2x2 using `_hstack` + `vstack`, supported in both FFmpeg and
+  `gpu_render.py`).
 - **SCREENCAST / WIDE** (`screencast_layout.py`, `SCREENCAST_LAYOUT=1`): for
   scenes whose meaning lives outside the centre. **Until 6-oct-2026 nothing
   asked which scenes those were**: the flag was set (by `layouts=["screencast"]`
@@ -156,16 +171,23 @@ width, so an explicit GENERAL override on a portrait clip cannot shrink it.
   tutorial clip mixes shots with and without it. The old whole-video detector (time ranges + width_fraction)
   was never called in production and is gone: it uploaded the source, ~670k
   tokens for a 37-min tutorial.
-- **INSET** (`camera_inset.py`): full-width screen on top, the enlarged webcam
-  box below, for a single source with the camera composited in a corner (OBS,
-  stream VODs). Chained after the `screencast` decision, **not** asked of Gemini
-  (offered as a fourth option it answered `screencast` and overall accuracy
-  dropped). The geometric detector needs three filters: a **small** subject,
-  **horizontally off-centre** (a talking-head face is centred even when high),
-  and **still between samples**. A **face** detection is grown to three face
-  widths (the webcam's head-and-shoulders framing) and the box never starts
-  below the head (`FACE_HEADROOM`): grown like YOLO's torso box and pinned to
-  the bottom edge it cut the forehead off.
+- **INSET / CAM_SCREEN** (`camera_inset.py`, `CAM_SCREEN_LAYOUT=1` /
+  `CAMERA_INSET_LAYOUT=1`): composes a 9:16 canvas with the **streamer's camera
+  on TOP** (`cam_dst`), a **central caption band** (`seam`, default 8% height),
+  and the **game/screen on BOTTOM** (`screen_dst`, guaranteed at least
+  `MIN_SCREEN_RATIO = 0.28` of canvas height). Both regions are extracted from
+  the original horizontal source with **strict aspect ratio preservation**
+  (`cam_src` aspect == `cam_dst` aspect, `screen_src` aspect == `screen_dst`
+  aspect) so neither faces nor HUD/game UI are ever stretched. Works either
+  chained after `screencast` or standalone (`CAM_SCREEN_LAYOUT=1`). Detection is
+  confidence-scored across distributed samples (`detect_with_confidence`,
+  `score_inset_samples`) and smoothed across scene boundaries
+  (`smooth_scene_insets`), falling back automatically to `WIDE`/`GENERAL` when
+  confidence is low, the webcam disappears, or layout shifts occur. In the
+  Reframe Editor (`ReframeEditor.jsx` / `POST /api/clip/reframe`), users can
+  manually toggle `cam + screen` per scene and drag the 2D camera region on the
+  original 16:9 frame (`camera` and `screen` overrides in
+  `reframe_v2.apply_crop_overrides`).
 - **ALTERNATE** (`active_speaker.py`, `SPEAKER_SIGNAL=1` + `SPEAKER_CUT=1`):
   hard cuts to whoever is talking, rendered through the TRACK path as a
   trajectory with jumps. `SPEAKER_SIGNAL=1` alone just gates SPLIT on both people
@@ -176,6 +198,35 @@ width, so an explicit GENERAL override on a portrait clip cannot shrink it.
   clip's beats, riding the TRACK path by widening its per-frame crop command from
   x-only to w/h/x/y. Beats come from the audio envelope; `emphasis_times` is a
   plain list of seconds so transcript hook words can replace it.
+
+## Visual & Editorial Quality Gate (`quality_gate.py`, `/api/clip/review`)
+
+Container dimensions (`1080x1920`), `SAR=1`, and automatic viral scores do not
+guarantee visual or editorial quality. `quality_gate.py` adds deterministic
+visual and editorial checks:
+
+- **Layer aspect ratio verification (`check_layer_aspect_ratios`)**: inspects
+  every `crop=...` → `scale=...` chain in a filtergraph to catch pre-baked
+  aspect distortion that `SAR=1` on the output container cannot detect.
+- **Face completeness & duplication (`check_border_face_cuts`,
+  `check_panel_duplication`)**: flags faces partially sliced by crop borders,
+  excluded participants in multi-person shots, or duplicate panels (both
+  filtergraph region overlap and rendered image similarity via dHash + HSV
+  histogram).
+- **Screen elements (`detect_screen_elements`)**: detects QR codes and static
+  corner overlays/banners with `recommended_action: "preserve_and_review"` so
+  essential context is never blindly cropped out.
+- **Safe areas & layout-aware captions (`check_caption_and_hook_safe_area`,
+  `subtitles.layout_caption_adjustments`)**: ensures captions and hooks stay
+  clear of faces and platform UI zones, scaling font size (`0.82x`) and capping
+  at `max_lines=2` on dense multi-panel/split layouts.
+- **Editorial integrity (`evaluate_editorial_quality`)**: checks that clips
+  start and end on complete sentences, qualifies rumors/speculation/opinions in
+  hooks and titles, and validates topic alignment between the source title and
+  the clip transcript.
+- **Human review gate (`POST /api/clip/review`)**: clips start in
+  `review_status="pending_review"` when warnings exist and transition to
+  `approved` or `rejected` via `/api/clip/review`.
 
 ## Key classes
 

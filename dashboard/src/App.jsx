@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket } from 'lucide-react';
+import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket, Radio, Square } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import McpConnectCard from './components/McpConnectCard';
@@ -353,6 +353,8 @@ function App() {
   const [jobId, setJobId] = useState(null);
   const [status, setStatus] = useState('idle'); // idle, processing, complete, error
   const [results, setResults] = useState(null);
+  const [liveSession, setLiveSession] = useState(null);
+  const [stoppingLive, setStoppingLive] = useState(false);
   // Best clips first. The backend hands them back in transcript order, which
   // buries the strongest one wherever it happens to fall in the video — and
   // the first card is the one people actually watch and publish.
@@ -738,7 +740,7 @@ function App() {
       // that can't be persisted, so point the recovered preview at the source
       // served by the backend instead of dropping it.
       let persistMedia = null;
-      if (processingMedia?.type === 'url') persistMedia = processingMedia;
+      if (processingMedia?.type === 'url' || processingMedia?.type === 'live') persistMedia = processingMedia;
       else if (processingMedia && jobId) persistMedia = { type: 'server', payload: `/api/source/${jobId}` };
       const sessionData = {
         jobId,
@@ -851,6 +853,16 @@ function App() {
           // Update results if available (real-time)
           if (data.result) {
             setResults(data.result);
+          }
+          if (data.live) {
+            setLiveSession(data.live);
+            if (data.live.stream_url) {
+              setProcessingMedia(prev => (
+                prev?.type === 'live' && prev.payload !== data.live.stream_url
+                  ? { ...prev, payload: data.live.stream_url }
+                  : prev
+              ));
+            }
           }
 
           if (data.partial) setPartialJob(data.partial);
@@ -1164,6 +1176,8 @@ function App() {
     setLogs(["Starting process..."]);
     setLogTimes([Date.now() / 1000]);
     setResults(null);
+    setLiveSession(null);
+    setStoppingLive(false);
     // Studio handovers have no local media object; the preview switches to the
     // backend-served source once the job id is known.
     setProcessingMedia(data.type === 'thumbnail_session' ? null : data);
@@ -1208,6 +1222,18 @@ function App() {
           force_low_quality: forceLowQuality,
           ...Object.fromEntries(Object.entries(advanced).filter(([, v]) => v != null)),
         });
+      } else if (data.type === 'live') {
+        headers['Content-Type'] = 'application/json';
+        body = JSON.stringify({
+          url: data.payload,
+          live: true,
+          acknowledged: !!data.acknowledged,
+          output_format: data.outputFormat || 'vertical',
+          chunk_minutes: data.chunkMinutes || 10,
+          min_score: data.minScore || 75,
+          max_clips_per_chunk: data.maxClipsPerChunk || 2,
+          ...Object.fromEntries(Object.entries(advanced).filter(([, v]) => v != null)),
+        });
       } else if (data.type === 'thumbnail_session') {
         // Handover from Thumbnail Studio (issue #68): the video and transcript
         // already live server-side, keyed by the Studio session.
@@ -1243,6 +1269,12 @@ function App() {
       }
 
       setJobId(resData.job_id);
+      if (resData.live) {
+        setLiveSession(resData.live);
+        if (resData.live.stream_url) {
+          setProcessingMedia({ type: 'live', payload: resData.live.stream_url });
+        }
+      }
       setPartialJob(resData.partial || null);
       setFirstVideoJob(!!resData.first_video);
       // The server clipped past the balance on its own (no wall): the first
@@ -1321,6 +1353,26 @@ function App() {
     handleProcessRef.current(pending.data);
   }, [billingEnabled, isSignedIn]);
 
+  const handleStopLive = async () => {
+    if (!jobId || stoppingLive) return;
+    setStoppingLive(true);
+    try {
+      const res = await apiFetch(`/api/live/${jobId}/stop`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ process_partial_chunk: true }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.live) setLiveSession(data.live);
+      }
+    } catch (e) {
+      console.error('Stop live failed', e);
+    } finally {
+      setStoppingLive(false);
+    }
+  };
+
   const handleReset = () => {
     setJobGone(false);
     // Flush any pending edit-state sync before dropping the project: the clips
@@ -1329,6 +1381,8 @@ function App() {
     setStatus('idle');
     setJobId(null);
     setResults(null);
+    setLiveSession(null);
+    setStoppingLive(false);
     setLogs([]);
     setLogTimes([]);
     setProcessingMedia(null);
@@ -2210,19 +2264,74 @@ function App() {
             <div className="h-full flex flex-col md:flex-row gap-3 md:gap-4 p-3 md:p-4 overflow-y-auto md:overflow-y-hidden custom-scrollbar animate-fade">
 
               {/* Left Panel: Preview & Status */}
-              <div className={`${status === 'complete' ? 'w-full md:w-[30%] lg:w-[25%]' : 'w-full md:w-[55%] lg:w-[60%]'} md:h-full flex flex-col shrink-0 md:shrink card p-3.5 sm:p-6 md:overflow-y-auto custom-scrollbar transition-all duration-700 ease-in-out`}>
+              <div className={`${(status === 'complete' || (liveSession && results?.clips?.length > 0)) ? 'w-full md:w-[30%] lg:w-[25%]' : 'w-full md:w-[55%] lg:w-[60%]'} md:h-full flex flex-col shrink-0 md:shrink card p-3.5 sm:p-6 md:overflow-y-auto custom-scrollbar transition-all duration-700 ease-in-out`}>
                 <div className="mb-4 sm:mb-6 flex items-center justify-between gap-2">
                   <h2 className="text-sm font-medium text-ink lowercase flex items-center gap-2">
-                    <Activity className={`text-brass ${status === 'processing' ? 'animate-pulse' : ''}`} size={18} />
-                    Live Analysis
+                    {liveSession ? (
+                      <Radio className={`text-danger ${liveSession.active ? 'animate-pulse' : ''}`} size={18} />
+                    ) : (
+                      <Activity className={`text-brass ${status === 'processing' ? 'animate-pulse' : ''}`} size={18} />
+                    )}
+                    {liveSession ? 'Live Stream Monitor' : 'Live Analysis'}
                   </h2>
                   <span className={status === 'processing' ? 'badge-brass' :
                     status === 'complete' ? 'badge-ok' :
                       'badge-danger'
                     }>
-                    {status.toUpperCase()}
+                    {liveSession && liveSession.active ? 'LIVE' : status.toUpperCase()}
                   </span>
                 </div>
+
+                {/* Live Stream Real-Time Telemetry & Stop Control */}
+                {liveSession && (
+                  <div className="mb-4 rounded-card border border-rule bg-paper2 p-3.5 space-y-3">
+                    {liveSession.stream_title && (
+                      <p className="text-xs font-medium text-ink truncate" title={liveSession.stream_title}>
+                        {liveSession.stream_title}
+                      </p>
+                    )}
+                    <div className="grid grid-cols-2 gap-2 text-xs">
+                      <div className="rounded-input bg-paper3 px-2.5 py-2">
+                        <span className="eyebrow block">windows analyzed</span>
+                        <span className="font-mono text-sm text-ink">{liveSession.chunks_processed || 0}</span>
+                      </div>
+                      <div className="rounded-input bg-paper3 px-2.5 py-2">
+                        <span className="eyebrow block">weak / silent skipped</span>
+                        <span className="font-mono text-sm text-muted">
+                          {(liveSession.chunks_skipped_sparse || 0) + (liveSession.chunks_skipped_low_score || 0)}
+                        </span>
+                      </div>
+                      <div className="rounded-input bg-paper3 px-2.5 py-2">
+                        <span className="eyebrow block">viral clips cut</span>
+                        <span className="font-mono text-sm text-brass">{liveSession.clips_generated || 0}</span>
+                      </div>
+                      <div className="rounded-input bg-paper3 px-2.5 py-2">
+                        <span className="eyebrow block">buffer cleaned</span>
+                        <span className="font-mono text-sm text-ok">{liveSession.disk_cleaned_mb || 0} MB</span>
+                      </div>
+                    </div>
+                    {liveSession.active && (
+                      <button
+                        type="button"
+                        onClick={handleStopLive}
+                        disabled={stoppingLive || liveSession.stop_requested}
+                        className="w-full btn-ghost border border-danger/40 text-danger hover:bg-danger/10 py-2 text-xs flex items-center justify-center gap-2"
+                      >
+                        {stoppingLive || liveSession.stop_requested ? (
+                          <>
+                            <Loader2 size={14} className="animate-spin" />
+                            Stopping & finalizing current window…
+                          </>
+                        ) : (
+                          <>
+                            <Square size={12} fill="currentColor" />
+                            Stop Live Monitoring
+                          </>
+                        )}
+                      </button>
+                    )}
+                  </div>
+                )}
 
                 {/* Trimmed run: say it while it renders, not only once the
                     clips land, so the shorter result is no surprise. */}
@@ -2348,7 +2457,7 @@ function App() {
               </div>
 
               {/* Right Panel: Results Grid */}
-              <div className={`${status === 'complete' ? 'w-full md:w-[70%] lg:w-[75%]' : 'w-full md:w-[45%] lg:w-[40%]'} md:h-full flex flex-col shrink-0 md:shrink card p-3.5 sm:p-6 transition-all duration-700 ease-in-out`}>
+              <div className={`${(status === 'complete' || (liveSession && results?.clips?.length > 0)) ? 'w-full md:w-[70%] lg:w-[75%]' : 'w-full md:w-[45%] lg:w-[40%]'} md:h-full flex flex-col shrink-0 md:shrink card p-3.5 sm:p-6 transition-all duration-700 ease-in-out`}>
                 {/* Title + counters on one row, the two actions on their own row
                     below. Wrapping them all together dropped a lone half-width
                     "schedule week" pill under the title on a phone. */}
@@ -2366,7 +2475,7 @@ function App() {
                       </span>
                     )}
                   </h2>
-                  {results?.clips?.length > 0 && status === 'complete' && (
+                  {results?.clips?.length > 0 && (status === 'complete' || liveSession) && (
                     <div className="flex flex-col sm:flex-row sm:justify-end items-stretch sm:items-center gap-2">
                       <button
                         onClick={handleDownloadAll}
@@ -2516,7 +2625,7 @@ function App() {
 
                 <div className="flex-1 overflow-y-auto custom-scrollbar p-1">
                   {results && results.clips && results.clips.length > 0 ? (
-                    <div className={`grid gap-4 pb-10 ${status === 'complete' ? 'grid-cols-[repeat(auto-fill,minmax(min(100%,600px),1fr))]' : 'grid-cols-1'}`}>
+                    <div className={`grid gap-4 pb-10 ${(status === 'complete' || liveSession) ? 'grid-cols-[repeat(auto-fill,minmax(min(100%,600px),1fr))]' : 'grid-cols-1'}`}>
                       {rankedClips.map(({ clip, index: i }) => (
                         <ResultCard
                           key={`${jobId}-${i}-${clip.video_url || ''}`}

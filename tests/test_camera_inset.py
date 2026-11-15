@@ -1,9 +1,14 @@
 from camera_inset import (
     INSET_ASPECT,
+    MIN_SCREEN_RATIO,
+    cam_screen_filtergraph,
+    cam_screen_geometry,
     inset_box,
     inset_filtergraph,
     is_cornered,
     nearest_corner,
+    score_inset_samples,
+    smooth_scene_insets,
     usable,
 )
 
@@ -142,3 +147,72 @@ class TestInsetFiltergraph:
         cam = graph.split("[ca]")[-1].split("[cam]")[0]
         for key in ("w=", "h=", "x=", "y="):
             assert int(cam.split(key)[1].split(":")[0].split(",")[0]) % 2 == 0
+
+    def test_camera_is_on_top_caption_band_in_middle_and_screen_on_bottom(self):
+        geom = cam_screen_geometry(1920, 1080, 1080, 1920, (30, 30, 356, 200))
+        cam_x, cam_y, cam_w, cam_h = geom["cam_dst"]
+        scr_x, scr_y, scr_w, scr_h = geom["screen_dst"]
+        cap_y0, cap_y1 = geom["caption_band_y"]
+
+        assert cam_y < scr_y
+        assert cam_y + cam_h <= cap_y0
+        assert cap_y1 <= scr_y
+        assert cap_y1 - cap_y0 >= 140
+        assert 0.35 <= geom["seam_y_fraction"] <= 0.65
+
+    def test_custom_screen_box_preserves_aspect_and_respects_min_screen_ratio(self):
+        geom = cam_screen_geometry(
+            1920, 1080, 1080, 1920,
+            (30, 30, 356, 200),
+            screen_box=(200, 100, 1520, 860),
+        )
+        sx, sy, sw, sh = geom["screen_src"]
+        dx, dy, dw, dh = geom["screen_dst"]
+        assert abs((sw / sh) - (dw / dh)) < 0.02
+        assert dh >= int(1920 * MIN_SCREEN_RATIO) - 2
+
+        graph = cam_screen_filtergraph(
+            1920, 1080, 1080, 1920,
+            (30, 30, 356, 200),
+            screen_box=(200, 100, 1520, 860),
+        )
+        screen_part = graph.split("[sa]")[-1].split("[screen]")[0]
+        assert "crop=" in screen_part
+
+
+class TestConfidenceAndSmoothing:
+    def test_consistent_corner_samples_score_high_confidence(self):
+        samples = [
+            (24, 24, 350, 196),
+            (26, 24, 348, 196),
+            (24, 26, 352, 198),
+            (25, 25, 350, 196),
+        ]
+        res = score_inset_samples(samples, 1920, 1080, total_samples=4)
+        assert res["box"] is not None
+        assert res["confidence"] >= 0.75
+        assert res["position_changes"] == 0
+        assert not res["fallback_recommended"]
+
+    def test_quadrant_jumping_penalizes_confidence_and_recommends_fallback(self):
+        samples = [
+            (20, 20, 350, 196),       # top-left
+            (1540, 860, 350, 196),    # bottom-right
+            (20, 860, 350, 196),      # bottom-left
+            (1540, 20, 350, 196),     # top-right
+        ]
+        res = score_inset_samples(samples, 1920, 1080, total_samples=4)
+        assert res["position_changes"] >= 2
+        assert res["fallback_recommended"]
+
+    def test_smooth_scene_insets_bridges_short_missing_camera_gap(self):
+        scenes = [(0, 90), (90, 120), (120, 240)]  # middle scene is 1.0s at 30fps
+        insets = {
+            0: (24, 24, 352, 198),
+            120: (28, 26, 348, 196),
+        }
+        smoothed = smooth_scene_insets(scenes, insets, fps=30.0)
+        assert 90 in smoothed
+        # Smoothed box matches the common top-left webcam median
+        assert smoothed[0] == smoothed[90] == smoothed[120]
+

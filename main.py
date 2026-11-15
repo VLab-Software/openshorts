@@ -34,6 +34,7 @@ import yt_account
 import twitch_signals
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, dedupe_overlapping,
+                            filter_by_min_score, max_window_score,
                             score_batches, shortlist_target,
                             snap_clip_to_words, trim_to_best,
                             vision_segments)
@@ -2181,6 +2182,33 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
         # Shortlist the top windows; scale with duration so long videos surface
         # more candidates without exploding the detail call.
         scored.sort(key=lambda w: w.get("score", 0), reverse=True)
+        live_mode = os.environ.get("LIVE_MODE", "").strip() == "1"
+        live_min_score = 0.0
+        live_min_window_score = 0.0
+        if live_mode:
+            try:
+                live_min_score = float(os.environ.get("LIVE_MIN_SCORE", "75") or 75)
+            except ValueError:
+                live_min_score = 75.0
+            try:
+                raw_win_score = os.environ.get("LIVE_MIN_WINDOW_SCORE", "").strip()
+                live_min_window_score = (
+                    float(raw_win_score) if raw_win_score else max(50.0, live_min_score - 10.0)
+                )
+            except ValueError:
+                live_min_window_score = max(50.0, live_min_score - 10.0)
+            best_win_score = max_window_score(scored)
+            print(f"LIVE_MAX_WINDOW_SCORE {best_win_score:.1f}", flush=True)
+            if live_min_window_score > 0 and best_win_score < live_min_window_score:
+                print(f"⏭️  Live chunk skipped at Pass 1: best window score "
+                      f"{best_win_score:.1f} < {live_min_window_score:.1f}")
+                print(f"LIVE_SKIPPED low_window_score {best_win_score:.1f}", flush=True)
+                return {
+                    "shorts": [],
+                    "live_skipped": "low_window_score",
+                    "max_window_score": best_win_score,
+                }
+
         by_id = {w["id"]: w for w in windows}
         shortlist = [by_id[w["id"]] for w in scored[:target] if w.get("id") in by_id]
         if not shortlist:
@@ -2218,7 +2246,7 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
         # already the best-scoring ones in the video — so they get one more
         # call for the missing clips. It may still come back empty, which is
         # the honest answer for material that does not hold more.
-        if len(shorts) < min_clips:
+        if len(shorts) < min_clips and not live_mode:
             used = {str(s.get("source_window_id") or "") for s in shorts}
             spare = [w for w in shortlist if w["id"] not in used]
             if spare:
@@ -2233,6 +2261,13 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
                     shorts = sorted(shorts + extra,
                                     key=lambda s: float(s.get("start") or 0))
                     print(f"   Recovered {len(extra)} clip(s) from them.")
+
+        if live_mode and live_min_score > 0 and shorts:
+            before_score = len(shorts)
+            shorts = filter_by_min_score(shorts, live_min_score)
+            if len(shorts) < before_score:
+                print(f"   Dropped {before_score - len(shorts)} clip(s) below "
+                      f"LIVE_MIN_SCORE={live_min_score:g}.")
 
         if len(shorts) > max_clips:
             # By score, never by position: the results arrive in transcript
@@ -2269,6 +2304,14 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             print(f"\U0001f4b0 Total cost ({model_name}, 2-pass, {len(costs)} calls): ${cost_analysis['total_cost']:.6f}")
 
         if not shorts:
+            if live_mode:
+                best_win = max_window_score(scored)
+                print(f"⏭️  Live chunk produced 0 clips >= {live_min_score:g}.")
+                print(f"LIVE_SKIPPED low_score {best_win:.1f}", flush=True)
+                res = {"shorts": [], "live_skipped": "low_score", "max_window_score": best_win}
+                if cost_analysis:
+                    res["cost_analysis"] = cost_analysis
+                return res
             print("⚠️ 2-pass returned no clips.")
             return None
 
@@ -2710,46 +2753,54 @@ if __name__ == '__main__':
         print(f"SOURCE_READY {input_video}", flush=True)
         sys.exit(0)
 
-    # Layout choice is per SOURCE video, not per clip: one upload and one call
-    # instead of one per clip, and the answer is a property of the material
-    # ("this is a screencast"), which does not change between its own clips.
-    # It runs before any render so the modules are switched on in time.
-    if layout_picker.ENABLED:
-        try:
-            _cap = cv2.VideoCapture(input_video)
-            _fps = _cap.get(cv2.CAP_PROP_FPS) or 30.0
-            _duration = int(_cap.get(cv2.CAP_PROP_FRAME_COUNT)) / _fps
-            _w = int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            _h = int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            _cap.release()
-            from reframe_v2 import source_already_fits  # imports main back
-            # A source already shot vertical has no width to reorganise, and
-            # the render passes it through whatever the model says. Asking
-            # anyway costs a Gemini call per upload to be ignored.
-            if _w and _h and source_already_fits(_w, _h, ASPECT_RATIO):
-                print(f"   ↕️  Source is {_w}x{_h} — already vertical, no layout to pick.")
-            else:
-                layout_picker.pick_and_apply(input_video, _duration)
-        except Exception as e:
-            print(f"⚠️ Layout choice skipped ({e}) — using the default layout.")
+    is_live_mode = os.environ.get("LIVE_MODE", "").strip() == "1"
 
-    # Subtitles already burned into the source: trim them off each cut clip so
-    # our captions are the only text layer (burned_subtitles.py). Only when we
-    # caption at all, and never on a vertical source, which is passed through.
-    source_subtitle_band = None
-    if (not args.skip_analysis
-            and os.environ.get("AUTO_CAPTIONS", "1").strip() != "0"):
-        try:
-            import burned_subtitles
-            _cap = cv2.VideoCapture(input_video)
-            _w = int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            _h = int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            _cap.release()
-            from reframe_v2 import source_already_fits
-            if not (_w and _h and source_already_fits(_w, _h, ASPECT_RATIO)):
-                source_subtitle_band = burned_subtitles.detect(input_video)
-        except Exception as e:
-            print(f"⚠️ Burned-in subtitle check skipped ({e}).")
+    def _run_source_prechecks():
+        # Layout choice is per SOURCE video, not per clip: one upload and one call
+        # instead of one per clip, and the answer is a property of the material
+        # ("this is a screencast"), which does not change between its own clips.
+        # It runs before any render so the modules are switched on in time.
+        if layout_picker.ENABLED:
+            try:
+                _cap = cv2.VideoCapture(input_video)
+                _fps = _cap.get(cv2.CAP_PROP_FPS) or 30.0
+                _duration = int(_cap.get(cv2.CAP_PROP_FRAME_COUNT)) / _fps
+                _w = int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                _h = int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                _cap.release()
+                from reframe_v2 import source_already_fits  # imports main back
+                # A source already shot vertical has no width to reorganise, and
+                # the render passes it through whatever the model says. Asking
+                # anyway costs a Gemini call per upload to be ignored.
+                if _w and _h and source_already_fits(_w, _h, ASPECT_RATIO):
+                    print(f"   ↕️  Source is {_w}x{_h} — already vertical, no layout to pick.")
+                else:
+                    layout_picker.pick_and_apply(input_video, _duration)
+            except Exception as e:
+                print(f"⚠️ Layout choice skipped ({e}) — using the default layout.")
+
+        # Subtitles already burned into the source: trim them off each cut clip so
+        # our captions are the only text layer (burned_subtitles.py). Only when we
+        # caption at all, and never on a vertical source, which is passed through.
+        band = None
+        if (not args.skip_analysis
+                and os.environ.get("AUTO_CAPTIONS", "1").strip() != "0"):
+            try:
+                import burned_subtitles
+                _cap = cv2.VideoCapture(input_video)
+                _w = int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                _h = int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                _cap.release()
+                from reframe_v2 import source_already_fits
+                if not (_w and _h and source_already_fits(_w, _h, ASPECT_RATIO)):
+                    band = burned_subtitles.detect(input_video)
+            except Exception as e:
+                print(f"⚠️ Burned-in subtitle check skipped ({e}).")
+        return band
+
+    # In LIVE_MODE, defer layout_picker and burned_subtitles until AFTER the
+    # transcript + Gemini score gate confirms this chunk has >= 1 viral clip.
+    source_subtitle_band = None if is_live_mode else _run_source_prechecks()
 
     # 2. Decision: Analyze clips or process whole?
     if args.skip_analysis:
@@ -2810,7 +2861,33 @@ if __name__ == '__main__':
                 transcript = transcribe_video(input_video)
                 save_transcript_checkpoint(output_dir, transcript, input_video, duration)
             except NoAudioError as e:
-                print(f"🔇 {e} — switching to visual analysis.")
+                print(f"🔇 {e} — {'skipping silent live chunk.' if is_live_mode else 'switching to visual analysis.'}")
+
+        # In LIVE_MODE, dead air / AFK / starting-soon screens are discarded
+        # before calling Gemini Vision or touching the GPU renderer.
+        if is_live_mode:
+            try:
+                min_wpm = float(os.environ.get("LIVE_MIN_WORDS_PER_MIN", "20") or 20)
+            except ValueError:
+                min_wpm = 20.0
+            n_words = sum(
+                len((sg.get("text") or "").split())
+                for sg in (transcript or {}).get("segments", [])
+            )
+            wpm = n_words / max(float(duration or 0) / 60.0, 1e-6)
+            print(f"LIVE_WORDS_PER_MIN {wpm:.1f}", flush=True)
+            if transcript is None or speech_is_sparse(transcript, duration) or wpm < min_wpm:
+                print(f"⏭️  Live chunk skipped: sparse speech ({n_words} words, {wpm:.1f} wpm < {min_wpm:g} wpm).")
+                print(f"LIVE_SKIPPED sparse_speech {wpm:.1f}", flush=True)
+                metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
+                write_json_atomic(metadata_file, {
+                    "shorts": [],
+                    "live_skipped": "sparse_speech",
+                    "words_per_min": round(wpm, 2),
+                    "transcript": transcript or {"language": "none", "segments": []},
+                }, indent=2)
+                clear_transcript_checkpoint(output_dir)
+                sys.exit(0)
 
         # Music-only or wordless footage transcribes to a handful of words.
         # Clip it by what is on screen instead, like a video with no audio.
@@ -2831,6 +2908,22 @@ if __name__ == '__main__':
         else:
             clips_data = get_visual_clips(input_video, duration, viewer_clips=viewer_clips)
 
+        if is_live_mode and (not clips_data or not clips_data.get('shorts')):
+            reason = (clips_data or {}).get("live_skipped") or "low_score"
+            max_w = (clips_data or {}).get("max_window_score") or 0.0
+            print(f"⏭️  Live chunk finished with 0 qualifying clips ({reason}).")
+            metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
+            write_json_atomic(metadata_file, {
+                "shorts": [],
+                "live_skipped": reason,
+                "max_window_score": max_w,
+                "transcript": transcript or {"language": "none", "segments": []},
+                **({"cost_analysis": clips_data["cost_analysis"]}
+                   if clips_data and clips_data.get("cost_analysis") else {}),
+            }, indent=2)
+            clear_transcript_checkpoint(output_dir)
+            sys.exit(0)
+
         if not clips_data or 'shorts' not in clips_data:
             # Deliberately fail instead of reframing the whole video: that path
             # wrote no metadata.json, so app.py marked the job failed anyway
@@ -2838,6 +2931,8 @@ if __name__ == '__main__':
             raise RuntimeError(
                 "Clip detection failed — the AI model did not return usable clips for this video.")
         else:
+            if is_live_mode:
+                source_subtitle_band = _run_source_prechecks()
             print(f"🔥 Found {len(clips_data['shorts'])} clips!")
 
             # Save metadata. Silent videos have no transcript → no subtitles,

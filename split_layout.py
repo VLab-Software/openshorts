@@ -90,11 +90,25 @@ def dedupe_faces(candidates, threshold=MAX_FACE_OVERLAP):
 
 
 def _two_largest(candidates, frame_w):
-    """The two biggest faces in a frame, left first, or None."""
+    """The two biggest faces in a frame, left first, or None.
+
+    Rejects frames with 3 or more separated participant-sized faces so podcast
+    mosaics and multi-guest tables are routed to ``panel_layout`` or full-width
+    ``GENERAL`` instead of forcing a 2-way split that duplicates the middle
+    speaker and cuts off outer participants.
+    """
     big = [c for c in dedupe_faces(candidates)
            if c['box'][2] >= MIN_FACE_WIDTH * frame_w]
     if len(big) < 2:
         return None
+    if len(big) >= 3:
+        centres = sorted(c['box'][0] + c['box'][2] / 2.0 for c in big)
+        distinct = [centres[0]]
+        for cx in centres[1:]:
+            if cx - distinct[-1] >= 0.12 * frame_w:
+                distinct.append(cx)
+        if len(distinct) >= 3:
+            return None
     big.sort(key=lambda c: c['score'], reverse=True)
     a, b = big[0], big[1]
     return tuple(sorted((a, b), key=lambda c: c['box'][0]))
@@ -145,11 +159,15 @@ def analyze_scene(frames, frame_w):
     return left, right
 
 
-def split_geometry(orig_w, orig_h, out_w, out_h, centre):
+def split_geometry(orig_w, orig_h, out_w, out_h, centre, neighbour_gap=None,
+                   neighbour_x=None):
     """Crop box (w, h, x, y) framing ``centre`` for one half of the stack.
 
     Each half is out_w x out_h/2, so the crop is much wider than the 9:16 one
     TRACK uses; on a 16:9 source it is the full height and ~63% of the width.
+    When ``neighbour_gap`` / ``neighbour_x`` are provided, tightens and shifts
+    the crop window away from the other speaker so the two halves do not
+    duplicate the middle of the frame or slice the neighbour's face.
     """
     half_h = out_h // 2
     half_h -= half_h % 2
@@ -161,12 +179,34 @@ def split_geometry(orig_w, orig_h, out_w, out_h, centre):
         crop_w = orig_w
         crop_h = int(round(crop_w / aspect))
 
-    crop_w -= crop_w % 2
-    crop_h -= crop_h % 2
+    if neighbour_gap is not None and neighbour_gap > 0:
+        allowed_w = max(int(round(neighbour_gap * 1.15)), int(round(orig_w * 0.30)), 2)
+        if crop_w > allowed_w:
+            crop_w = min(orig_w, allowed_w)
+            crop_h = int(round(crop_w / aspect))
+            if crop_h > orig_h:
+                crop_h = orig_h
+                crop_w = int(round(crop_h * aspect))
+
+    crop_w = max(2, crop_w - (crop_w % 2))
+    crop_h = max(2, crop_h - (crop_h % 2))
 
     cx, cy = centre[0], centre[1]
     x = int(round(cx - crop_w / 2.0))
     x = max(0, min(x, orig_w - crop_w))
+
+    if neighbour_x is not None and abs(neighbour_x - cx) > 1e-3:
+        midpoint = (cx + neighbour_x) / 2.0
+        face_w = centre[2] if len(centre) > 2 else orig_w * 0.08
+        face_margin = max(face_w * 0.85, orig_w * 0.06)
+        if cx < neighbour_x and x + crop_w > midpoint:
+            shifted_x = int(round(midpoint - crop_w))
+            min_allowed_x = max(0, int(round(cx + face_margin - crop_w)))
+            x = max(0, min(max(min_allowed_x, shifted_x), orig_w - crop_w))
+        elif cx > neighbour_x and x < midpoint:
+            shifted_x = int(round(midpoint))
+            max_allowed_x = min(orig_w - crop_w, int(round(cx - face_margin)))
+            x = max(0, min(min(max_allowed_x, shifted_x), orig_w - crop_w))
 
     # Faces sit high in a frame, so centring the crop on the face centre buries
     # the speaker's chin at the bottom edge when the crop is shorter than the
@@ -184,10 +224,13 @@ def split_filtergraph(orig_w, orig_h, out_w, out_h, left_centre, right_centre):
     keying off who speaks first would swap the two halves between scenes of the
     same conversation, which reads as an edit mistake.
     """
+    gap = abs(right_centre[0] - left_centre[0])
     top_w, top_h, top_x, top_y, half_h = split_geometry(
-        orig_w, orig_h, out_w, out_h, left_centre)
+        orig_w, orig_h, out_w, out_h, left_centre,
+        neighbour_gap=gap, neighbour_x=right_centre[0])
     bot_w, bot_h, bot_x, bot_y, _ = split_geometry(
-        orig_w, orig_h, out_w, out_h, right_centre)
+        orig_w, orig_h, out_w, out_h, right_centre,
+        neighbour_gap=gap, neighbour_x=left_centre[0])
 
     return (
         f"[0:v]split=2[ta][ba];"

@@ -48,23 +48,25 @@ def clip_count_targets(n_windows):
     import os
 
     n = max(1, int(n_windows or 1))
+    live_mode = os.environ.get("LIVE_MODE", "").strip() == "1"
     # Floor grows with the material: 3 windows -> 3, 5 -> 4, 10+ -> 6.
-    low = max(2, min(6, n // 2 + 2))
+    # In LIVE_MODE a boring rolling window should yield 0 clips rather than filler.
+    low = 0 if live_mode else max(2, min(6, n // 2 + 2))
     # Ceiling allows a rich window to yield more than one without inviting padding.
     high = min(12, max(4, n * 2))
     low = min(low, high)
 
-    def _override(name, current):
+    def _override(name, current, minimum=1):
         raw = os.environ.get(name)
         if not raw:
             return current
         try:
-            return max(1, int(raw))
+            return max(minimum, int(raw))
         except ValueError:
             return current
 
-    low = _override("CLIP_TARGET_MIN", low)
-    high = _override("CLIP_TARGET_MAX", high)
+    low = _override("CLIP_TARGET_MIN", low, minimum=0 if live_mode else 1)
+    high = _override("CLIP_TARGET_MAX", high, minimum=1)
     return low, max(low, high)
 
 
@@ -388,3 +390,258 @@ def snap_clip_to_words(start, end, words, video_duration,
     if new_end <= new_start or new_end - new_start < min_duration:
         return original
     return (round(new_start, 3), round(new_end, 3))
+
+
+def max_window_score(scored_windows) -> float:
+    """Highest score among Pass-1 scored transcript windows, or 0.0 if empty."""
+    best = 0.0
+    for w in scored_windows or []:
+        try:
+            s = float((w or {}).get("score") or 0.0)
+            if s > best:
+                best = s
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return best
+
+
+def filter_by_min_score(shorts, min_score: float):
+    """Keep only clips whose ``predicted_score >= min_score`` (preserving order)."""
+    try:
+        threshold = float(min_score or 0.0)
+    except (TypeError, ValueError):
+        threshold = 0.0
+    if threshold <= 0:
+        return list(shorts or [])
+    out = []
+    for clip in shorts or []:
+        try:
+            score = float((clip or {}).get("predicted_score") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            score = 0.0
+        if score >= threshold:
+            out.append(clip)
+    return out
+
+
+def shift_transcript(transcript: dict, offset_seconds: float, min_start: float = 0.0) -> dict:
+    """Return a copy of ``transcript`` with all segment/word timestamps shifted
+    by ``+offset_seconds``.
+
+    Segments ending at or before ``min_start`` (in the chunk's own time, e.g.
+    the 30s overlap already covered by the previous chunk) can be filtered out
+    by passing ``min_start > 0`` when merging transcripts, or kept when
+    ``min_start == 0``.
+    """
+    offset = float(offset_seconds or 0.0)
+    floor = float(min_start or 0.0)
+    segments_out = []
+    for seg in (transcript or {}).get("segments") or []:
+        try:
+            s = float(seg.get("start", 0.0))
+            e = float(seg.get("end", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if e <= floor:
+            continue
+        new_seg = dict(seg)
+        new_seg["start"] = round(s + offset, 3)
+        new_seg["end"] = round(e + offset, 3)
+        if "words" in seg and isinstance(seg["words"], list):
+            words_out = []
+            for w in seg["words"]:
+                if not isinstance(w, dict):
+                    continue
+                try:
+                    ws = float(w.get("start", s))
+                    we = float(w.get("end", e))
+                except (TypeError, ValueError):
+                    continue
+                nw = dict(w)
+                nw["start"] = round(ws + offset, 3)
+                nw["end"] = round(we + offset, 3)
+                words_out.append(nw)
+            new_seg["words"] = words_out
+        segments_out.append(new_seg)
+    return {
+        "language": (transcript or {}).get("language", "unknown"),
+        "segments": segments_out,
+    }
+
+
+def dedupe_against_stream_spans(shorts, existing_stream_spans, chunk_stream_offset: float,
+                                ratio: float = 0.25):
+    """Drop clips from a new live chunk that overlap clips already emitted in
+    earlier chunks (e.g. inside the 30s boundary overlap).
+
+    ``existing_stream_spans`` is a list of ``(stream_start, stream_end)`` tuples
+    in real stream seconds. Each candidate clip in ``shorts`` has chunk-local
+    ``start``/``end`` which map to ``start + chunk_stream_offset`` in stream time.
+    """
+    offset = float(chunk_stream_offset or 0.0)
+    kept = []
+    for clip in shorts or []:
+        try:
+            cs = float(clip.get("start", 0.0)) + offset
+            ce = float(clip.get("end", 0.0)) + offset
+        except (TypeError, ValueError, AttributeError):
+            continue
+        clash = False
+        for es, ee in existing_stream_spans or []:
+            overlap = min(ce, float(ee)) - max(cs, float(es))
+            shorter = max(1e-6, min(ce - cs, float(ee) - float(es)))
+            if overlap > 0 and (overlap / shorter) >= ratio:
+                clash = True
+                break
+        if not clash:
+            kept.append(clip)
+    return kept
+
+
+_SPECULATIVE_MARKERS = (
+    "acho", "opinião", "opiniao", "rumor", "boato", "teoria", "vazamento",
+    "vazou", "especulação", "especulacao", "talvez", "pode ser", "chute",
+    "previsão", "previsao", "supostamente", "hipótese", "hipotese",
+    "rumour", "leak", "leaked", "theory", "speculation", "i think",
+    "my opinion", "might be", "allegedly", "prediction", "guess",
+)
+
+_FACTUAL_ASSERTION_MARKERS = (
+    "confirmado", "oficial", "é fato", "vai custar", "revelado", "anunciado",
+    "100% confirmado", "confirmed", "official", "officially", "will cost",
+    "is confirmed", "revealed",
+)
+
+_QUALIFIER_MARKERS = (
+    "rumor", "boato", "teoria", "opinião", "opiniao", "será", "sera",
+    "diz", "acha", "segundo", "vazamento", "?", "pode", "talvez",
+    "rumour", "theory", "opinion", "leak", "might", "could", "claims",
+    "thinks",
+)
+
+_DANGLING_START_PREFIXES = (
+    "e aí", "e ai", "mas então", "mas entao", "então tipo", "entao tipo",
+    "porque tipo", "and then", "but so", "so anyway",
+)
+
+_STOPWORDS = frozenset({
+    "de", "da", "do", "das", "dos", "em", "no", "na", "nos", "nas", "para",
+    "por", "com", "um", "uma", "o", "a", "os", "as", "e", "ou", "que", "se",
+    "the", "of", "in", "on", "to", "for", "with", "a", "an", "and", "or",
+    "is", "are", "video", "vídeo", "clip", "clipe", "podcast", "cortes",
+    "live", "stream", "react", "reação", "reacao", "trailer", "gameplay",
+})
+
+
+def _clip_transcript_text(clip, transcript):
+    """Extract spoken text inside ``[clip.start, clip.end]`` from ``transcript``."""
+    if not transcript or not isinstance(transcript, dict):
+        return ""
+    try:
+        c_start = float(clip.get("start", 0.0))
+        c_end = float(clip.get("end", 0.0))
+    except (TypeError, ValueError, AttributeError):
+        return ""
+    parts = []
+    for seg in transcript.get("segments") or []:
+        words = seg.get("words") or []
+        if words:
+            for w in words:
+                try:
+                    ws = float(w.get("start", w.get("s", 0.0)))
+                    we = float(w.get("end", w.get("e", 0.0)))
+                except (TypeError, ValueError):
+                    continue
+                if we > c_start and ws < c_end:
+                    token = str(w.get("word", w.get("w", ""))).strip()
+                    if token:
+                        parts.append(token)
+        else:
+            try:
+                ss = float(seg.get("start", 0.0))
+                se = float(seg.get("end", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if se > c_start and ss < c_end:
+                txt = str(seg.get("text") or "").strip()
+                if txt:
+                    parts.append(txt)
+    return " ".join(parts).strip()
+
+
+def evaluate_editorial_quality(clip, transcript=None, source_title=None):
+    """Evaluate a candidate clip's editorial fidelity against the spoken transcript.
+
+    Checks:
+      1. ``sentence_complete``: whether the clip starts and ends on complete
+         sentences rather than a dangling connective or mid-thought cut.
+      2. ``rumor_qualified``: when the transcript discusses rumors, leaks,
+         predictions or personal opinions, ensures the hook and title do not
+         present them as unqualified facts.
+      3. ``topic_relevant``: when ``source_title`` names a specific subject
+         (e.g. "GTA 6"), flags clips that only discuss a generic tangent
+         without mentioning the subject.
+    """
+    import re
+
+    warnings = []
+    spoken = _clip_transcript_text(clip or {}, transcript)
+    spoken_lower = spoken.lower()
+    hook = str((clip or {}).get("viral_hook_text") or "").strip()
+    title = str((clip or {}).get("video_title_for_youtube_short") or "").strip()
+    copy_lower = f"{hook} {title}".lower()
+
+    # 1. Sentence boundary check
+    sentence_complete = True
+    if spoken:
+        for prefix in _DANGLING_START_PREFIXES:
+            if spoken_lower.startswith(prefix + " "):
+                sentence_complete = False
+                warnings.append("starts_on_dangling_connective")
+                break
+        if spoken.startswith("-") or spoken.startswith("..."):
+            sentence_complete = False
+            warnings.append("starts_mid_word_or_thought")
+        if not re.search(r'[.!?…"”\'\)]$', spoken):
+            # If the transcript carries punctuation elsewhere but not at the end,
+            # flag it as a possible mid-sentence tail cut.
+            if any(p in spoken for p in (".", "!", "?")):
+                sentence_complete = False
+                warnings.append("ends_without_terminal_punctuation")
+
+    # 2. Rumor / opinion epistemic check
+    rumor_or_opinion = any(m in spoken_lower for m in _SPECULATIVE_MARKERS)
+    rumor_qualified = True
+    if rumor_or_opinion and copy_lower.strip():
+        has_factual_claim = any(m in copy_lower for m in _FACTUAL_ASSERTION_MARKERS)
+        has_qualifier = any(q in copy_lower for q in _QUALIFIER_MARKERS)
+        if has_factual_claim and not has_qualifier:
+            rumor_qualified = False
+            warnings.append("opinion_or_rumor_stated_as_fact")
+
+    # 3. Topic relevance check against source_title
+    topic_relevant = True
+    if source_title and spoken:
+        tokens = [
+            t.lower()
+            for t in re.findall(r"[A-Za-zÀ-ÿ0-9]+", str(source_title))
+            if len(t) >= 3 and t.lower() not in _STOPWORDS
+        ]
+        if tokens:
+            matched = [t for t in tokens if t in spoken_lower or t in copy_lower]
+            if not matched:
+                topic_relevant = False
+                warnings.append("tangent_from_source_topic")
+
+    needs_review = (not sentence_complete
+                    or not rumor_qualified
+                    or not topic_relevant)
+    return {
+        "sentence_complete": sentence_complete,
+        "rumor_or_opinion_detected": rumor_or_opinion,
+        "rumor_qualified": rumor_qualified,
+        "topic_relevant": topic_relevant,
+        "needs_editorial_review": needs_review,
+        "warnings": warnings,
+    }
+

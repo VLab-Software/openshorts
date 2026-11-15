@@ -25,6 +25,7 @@ import active_speaker
 import gpu_decode
 import gpu_render
 import camera_inset
+import panel_layout
 import punch_in
 import screencast_layout
 import layout_ranges
@@ -137,6 +138,39 @@ def full_width_content_height(orig_w, orig_h, out_w):
     return fg_h + (fg_h % 2)
 
 
+def safe_general_content_height(orig_w, orig_h, out_w, out_h, face_boxes=None,
+                                margin_ratio=0.02):
+    """Foreground height for GENERAL that keeps every detected face inside the
+    visible horizontal crop window.
+
+    By default GENERAL scales a 16:9 frame to ``0.42 * out_h`` (806px on 1920),
+    which trims ~12% off both the left and right edges to give the picture more
+    vertical presence. When a multi-person shot has someone seated near either
+    edge (like the outer participants in a 3-person podcast mosaic), that trim
+    slices their face at the border. This helper shrinks ``fg_h`` toward
+    ``full_width_content_height`` just enough so all ``face_boxes`` stay clear
+    of the left/right edges.
+    """
+    fg_h = int(out_h * GENERAL_CONTENT_HEIGHT_RATIO)
+    full_h = full_width_content_height(orig_w, orig_h, out_w)
+    fg_h = max(fg_h, full_h)
+    if face_boxes and orig_w > 0 and orig_h > 0 and fg_h > full_h:
+        margin = orig_w * float(margin_ratio)
+        half_spans = []
+        for box in face_boxes:
+            if not box or len(box) < 4:
+                continue
+            fx, _fy, fw, _fh = [float(v) for v in box[:4]]
+            left_dist = (orig_w / 2.0) - max(0.0, fx - margin)
+            right_dist = min(float(orig_w), fx + fw + margin) - (orig_w / 2.0)
+            half_spans.append(max(left_dist, right_dist))
+        if half_spans:
+            req_vis_w = min(float(orig_w), max(1.0, 2.0 * max(half_spans)))
+            safe_h = int(round(out_w * orig_h / req_vis_w))
+            fg_h = max(full_h, min(fg_h, safe_h))
+    return fg_h + (fg_h % 2)
+
+
 def _wide_crop(input_video, orig_w, orig_h, out_w, out_h, start_f, end_f, focus):
     """The columns an automatic WIDE scene without a narrow reading area shows
     (screencast_layout.wide_crop), centred on the scene's motion, else on the
@@ -156,7 +190,8 @@ def _wide_crop(input_video, orig_w, orig_h, out_w, out_h, start_f, end_f, focus)
     return screencast_layout.wide_crop(orig_w, orig_h, out_w, out_h, centre)
 
 
-def general_filtergraph(out_w, out_h, content_h=None, orig_w=None, orig_h=None):
+def general_filtergraph(out_w, out_h, content_h=None, orig_w=None, orig_h=None,
+                        face_boxes=None):
     """Blurred-background 'general shot' layout: bg fills the frame (centre-
     cropped, blurred), fg is scaled to a readable share of the height and
     centred, overflowing the sides rather than floating small in the middle.
@@ -172,9 +207,17 @@ def general_filtergraph(out_w, out_h, content_h=None, orig_w=None, orig_h=None):
     an already-9:16 upload came back as a 453px sliver floating over a blurred
     copy of itself. Filling the width is the floor, never the target.
     """
-    fg_h = content_h if content_h else int(out_h * GENERAL_CONTENT_HEIGHT_RATIO)
-    if orig_w and orig_h:
-        fg_h = max(fg_h, full_width_content_height(orig_w, orig_h, out_w))
+    if content_h:
+        fg_h = content_h
+        if orig_w and orig_h:
+            fg_h = max(fg_h, full_width_content_height(orig_w, orig_h, out_w))
+    elif face_boxes and orig_w and orig_h:
+        fg_h = safe_general_content_height(
+            orig_w, orig_h, out_w, out_h, face_boxes=face_boxes)
+    else:
+        fg_h = int(out_h * GENERAL_CONTENT_HEIGHT_RATIO)
+        if orig_w and orig_h:
+            fg_h = max(fg_h, full_width_content_height(orig_w, orig_h, out_w))
     fg_h += fg_h % 2
     return (
         f"[0:v]split=2[bga][fga];"
@@ -189,32 +232,61 @@ def general_filtergraph(out_w, out_h, content_h=None, orig_w=None, orig_h=None):
 
 # --- analysis ---------------------------------------------------------------
 
+def _region_box(spec, orig_w, orig_h, default_w=0.24, default_h=0.24):
+    """Convert a manual region spec (dict or 4-tuple in fractions or pixels)
+    into an integer (x, y, w, h) box inside ``orig_w x orig_h``."""
+    if isinstance(spec, (list, tuple)) and len(spec) == 4:
+        vals = [float(v) for v in spec]
+        if all(0.0 <= v <= 1.0 for v in vals) and max(vals[2], vals[3]) <= 1.0:
+            x, y, w, h = (vals[0] * orig_w, vals[1] * orig_h,
+                          vals[2] * orig_w, vals[3] * orig_h)
+        else:
+            x, y, w, h = vals
+    elif isinstance(spec, dict):
+        fx = float(spec["x"])
+        fy = float(spec.get("y", 0.5))
+        if "w" in spec and "h" in spec:
+            fw, fh = float(spec["w"]), float(spec["h"])
+            if fw <= 1.0 and fh <= 1.0 and fx <= 1.0 and fy <= 1.0:
+                w = fw * orig_w
+                h = fh * orig_h
+                x = fx * orig_w
+                y = fy * orig_h
+            else:
+                x, y, w, h = fx, fy, fw, fh
+        else:
+            # Centre point given in fractions: build a 16:9 box around it
+            w = default_w * orig_w
+            h = min(orig_h, w / (16.0 / 9.0)) if default_h == 0.24 else default_h * orig_h
+            x = fx * orig_w - w / 2.0
+            y = fy * orig_h - h / 2.0
+    else:
+        raise ValueError("invalid region spec")
+
+    w = max(2, min(int(round(w)), orig_w))
+    h = max(2, min(int(round(h)), orig_h))
+    x = max(0, min(int(round(x)), orig_w - w))
+    y = max(0, min(int(round(y)), orig_h - h))
+    return (x, y, w, h)
+
+
 def apply_crop_overrides(xs, strategies, scene_boundaries, overrides,
-                         crop_w, orig_w, orig_h=None, splits=None):
+                         crop_w, orig_w, orig_h=None, splits=None,
+                         insets=None):
     """Frame the scenes the user positioned by hand.
 
     ``overrides`` maps a scene index to either
 
       * a number — the crop CENTRE as a fraction of the source width, giving a
-        single locked 9:16 window for that scene; or
+        single locked 9:16 window for that scene;
       * ``{"top": v, "bottom": v}`` — two centres, stacking those two regions
         one above the other (the SPLIT layout). Each half is either a bare
         fraction (horizontal only) or ``{"x": f, "y": f}``; SPLIT crops are
-        SHORTER than the source, so they carry a vertical centre too.
-
-    Fractions travel instead of pixels because the editor knows where it
-    dropped the rectangle, not the source's dimensions, and the same number
-    survives a source re-encode at another resolution.
-
-    A hand-framed scene overrides its automatic verdict outright: the single
-    form forces TRACK so a scene the detector had sent to GENERAL (blurred
-    background) comes back to a vertical crop, and the split form writes
-    straight into ``splits``, so the user can stack a scene the detector never
-    proposed — no dependency on SPLIT_LAYOUT being switched on.
-
-    Runs after every automatic pass, including the ALTERNATE writes, so a
-    manual choice always wins. Unknown scene indices and malformed values are
-    skipped rather than rejected: a stale editor tab must not fail the render.
+        SHORTER than the source, so they carry a vertical centre too; or
+      * ``{"camera": region, "screen": region?}`` — manual Camera + Screen
+        selection in the original source frame (camera on top, central
+        subtitle band, game/screen on bottom), writing into ``insets`` and
+        setting the scene's strategy to ``INSET``.
     """
     max_x = max(0, orig_w - crop_w)
 
@@ -231,6 +303,25 @@ def apply_crop_overrides(xs, strategies, scene_boundaries, overrides,
         start_f, end_f = scene_boundaries[idx]
         end_f = min(end_f, len(xs))
         if end_f <= start_f:
+            continue
+
+        if isinstance(value, dict) and "camera" in value:
+            if insets is None or not orig_h:
+                continue
+            try:
+                cam_box = _region_box(value["camera"], orig_w, orig_h)
+                scr_box = (_region_box(value["screen"], orig_w, orig_h,
+                                       default_w=1.0, default_h=1.0)
+                           if value.get("screen") is not None else None)
+            except (KeyError, TypeError, ValueError):
+                continue
+            insets[start_f] = (
+                {"camera": cam_box, "screen": scr_box}
+                if scr_box is not None else cam_box
+            )
+            strategies[idx] = 'INSET'
+            if splits is not None:
+                splits.pop(start_f, None)
             continue
 
         if isinstance(value, dict):
@@ -255,6 +346,8 @@ def apply_crop_overrides(xs, strategies, scene_boundaries, overrides,
                 continue
             splits[start_f] = centres
             strategies[idx] = 'SPLIT'
+            if insets is not None:
+                insets.pop(start_f, None)
             continue
 
         try:
@@ -264,15 +357,54 @@ def apply_crop_overrides(xs, strategies, scene_boundaries, overrides,
         xs[start_f:end_f] = [x] * (end_f - start_f)
         strategies[idx] = 'TRACK'
         # A scene taken over by a single locked crop must not also carry a
-        # stale split recipe from the detector.
+        # stale split or inset recipe from the detector.
         if splits is not None:
             splits.pop(start_f, None)
+        if insets is not None:
+            insets.pop(start_f, None)
 
     return xs, strategies
 
 
+def smooth_layout_transitions(strategies, scene_boundaries, fps,
+                              min_scene_seconds=1.8, insets=None,
+                              splits=None, panels=None):
+    """Prevent rapid layout flapping across short cuts (< ``min_scene_seconds``).
+
+    When scene ``i`` is shorter than ``min_scene_seconds`` and scenes ``i-1``
+    and ``i+1`` share the same layout, carry that layout (and its static recipe
+    if needed) across scene ``i`` so the viewer does not experience a 1-second
+    layout jump.
+    """
+    out = list(strategies)
+    fps = float(fps or 30.0)
+    for i in range(1, len(out) - 1):
+        if i >= len(scene_boundaries):
+            break
+        sf, ef = scene_boundaries[i]
+        dur = (ef - sf) / fps
+        if dur > min_scene_seconds:
+            continue
+        prev_s, next_s = out[i - 1], out[i + 1]
+        if prev_s != next_s or out[i] == prev_s:
+            continue
+        prev_sf = scene_boundaries[i - 1][0]
+        if prev_s == 'INSET' and insets is not None and prev_sf in insets:
+            insets.setdefault(sf, insets[prev_sf])
+            out[i] = 'INSET'
+        elif prev_s == 'SPLIT' and splits is not None and prev_sf in splits:
+            splits.setdefault(sf, splits[prev_sf])
+            out[i] = 'SPLIT'
+        elif prev_s == 'PANEL' and panels is not None and prev_sf in panels:
+            panels.setdefault(sf, panels[prev_sf])
+            out[i] = 'PANEL'
+        elif prev_s in ('GENERAL', 'WIDE', 'TRACK'):
+            out[i] = prev_s
+    return out
+
+
 # Layouts whose crop is fixed for the whole scene: no camera trajectory.
-_STATIC_LAYOUTS = ('GENERAL', 'SPLIT', 'SCREENCAST', 'WIDE', 'INSET', 'ALTERNATE')
+_STATIC_LAYOUTS = ('GENERAL', 'SPLIT', 'PANEL', 'SCREENCAST', 'WIDE', 'INSET', 'ALTERNATE')
 
 # Decode only the frames the trajectory runs a detector on (see
 # _detection_frames). SPARSE_TRAJECTORY=0 pipes every frame again.
@@ -701,6 +833,18 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
         if not content_ranges and screencast_layout.ENABLED:
             content_ranges = screen_ranges(input_video, scenes, fps, strategies)
 
+    # PANEL (3-4 people in a 2x2 grid) runs on GENERAL scenes before SPLIT so
+    # 3-person podcast mosaics get their dedicated grid when PANEL_LAYOUT=1.
+    panels = {}
+    detected_panels = {} if (passthrough or force_strategy) else panel_layout.detect_panel_scenes(
+        input_video, scenes, strategies)
+    for scene_idx, centres in detected_panels.items():
+        strategies[scene_idx] = 'PANEL'
+        start_f = scene_boundaries[scene_idx][0]
+        panels[start_f] = centres
+    if panels:
+        print(f"   🧩 PANEL layout on {len(panels)} scene(s)")
+
     # SPLIT is an upgrade applied on top of the TRACK/GENERAL verdict, keyed by
     # the scene's START FRAME rather than its index: scene_frame_ranges() drops
     # empty ranges, so indices there don't line up with `scenes`. A surviving
@@ -708,7 +852,7 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     # that begin past the last decoded frame, and those get dropped).
     splits = {}
     split_scene_of = {}
-    detected_splits = {} if passthrough else split_layout.detect_split_scenes(
+    detected_splits = {} if (passthrough or force_strategy) else split_layout.detect_split_scenes(
         input_video, scenes, strategies)
     for scene_idx, centres in detected_splits.items():
         strategies[scene_idx] = 'SPLIT'
@@ -749,13 +893,24 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     # five clips that had one, while camera_inset.detect finds all five with no
     # false positives. The box is fixed for the whole video, so it is found once.
     inset = None
-    if content_ranges and screencast_layout.ENABLED:
+    inset_confidence = None
+    want_inset = ((content_ranges and screencast_layout.ENABLED)
+                  or camera_inset.ENABLED
+                  or force_strategy in ('INSET', 'CAM_SCREEN'))
+    if want_inset and not passthrough:
         try:
-            inset = camera_inset.detect(input_video)
+            report = camera_inset.detect_with_confidence(input_video)
+            if report and report.get("box") and not report.get("fallback_recommended"):
+                inset = report["box"]
+                inset_confidence = report.get("confidence")
+            else:
+                inset = camera_inset.detect(input_video)
+                if inset and inset_confidence is None:
+                    inset_confidence = 0.75
         except Exception as e:
             print(f"   ⚠️ Inset check failed ({e}) — using the screen layouts.")
         if inset:
-            print(f"   📹 Webcam inset at {inset}")
+            print(f"   📹 Webcam inset at {inset} (confidence={inset_confidence})")
 
     screencasts = {}
     focus_crops = {}
@@ -786,6 +941,7 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
                 plan, centre = 'INSET', None
             strategies[scene_idx] = plan
             splits.pop(start_f, None)
+            panels.pop(start_f, None)
             if plan == 'SCREENCAST':
                 screencasts[start_f] = centre  # (face centre, content columns)
             elif plan == 'INSET':
@@ -800,6 +956,34 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
                                       start_f, end_f, centre)
                 if crop:
                     focus_crops[start_f] = crop
+    elif inset and (camera_inset.ENABLED or force_strategy in ('INSET', 'CAM_SCREEN')):
+        # Standalone Camera + Screen mode (gameplay / trailer reaction with a
+        # corner webcam where screencast_layout's text/chart check was not used).
+        for scene_idx, (start_f, end_f) in enumerate(scene_boundaries):
+            if camera_inset.present_in_scene(input_video, inset, start_f, end_f):
+                strategies[scene_idx] = 'INSET'
+                insets[start_f] = inset
+                splits.pop(start_f, None)
+                panels.pop(start_f, None)
+                inset_count += 1
+            elif force_strategy in ('INSET', 'CAM_SCREEN'):
+                # Camera disappeared in this scene: fall back to full-width
+                # WIDE so we never render an empty webcam crop at the top.
+                strategies[scene_idx] = 'WIDE'
+                wide_count += 1
+
+    if insets:
+        insets = camera_inset.smooth_scene_insets(scenes, insets, fps)
+        for scene_idx, (start_f, _end_f) in enumerate(scene_boundaries):
+            if start_f in insets and strategies[scene_idx] != 'INSET':
+                strategies[scene_idx] = 'INSET'
+                inset_count += 1
+
+    if not force_strategy and not passthrough:
+        strategies = smooth_layout_transitions(
+            strategies, scene_boundaries, fps,
+            insets=insets, splits=splits, panels=panels)
+
     if screencasts:
         print(f"   🖥️ SCREENCAST layout on {len(screencasts)} scene(s)")
     if wide_count:
@@ -845,7 +1029,7 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     if crop_overrides:
         xs, strategies = apply_crop_overrides(
             xs, strategies, scene_boundaries, crop_overrides, crop_w,
-            orig_w, orig_h=orig_h, splits=splits)
+            orig_w, orig_h=orig_h, splits=splits, insets=insets)
         print(f"   ✋ Manual framing on {len(crop_overrides)} scene(s)")
 
     ranges = scene_frame_ranges(scene_boundaries, strategies, len(xs))
@@ -862,15 +1046,26 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
         # their per-frame crop boxes for the GPU render and a sendcmd file for
         # the ffmpeg one; every other layout is its filtergraph.
         specs = []
-        bands = {}  # WIDE scene start -> (top, bottom) of its picture
+        bands = {}  # WIDE/INSET scene start -> (top, bottom) of its picture
+        seams = {}  # INSET scene start -> vertical seam fraction
         for idx, (start_f, end_f, strategy) in enumerate(ranges):
             ss = start_f / fps
             dur = (end_f - start_f) / fps
             boxes = None
 
-            if strategy == 'INSET':
-                graph = camera_inset.inset_filtergraph(
-                    orig_w, orig_h, out_w, out_h, insets.get(start_f, inset))
+            if strategy in ('INSET', 'CAM_SCREEN'):
+                inset_spec = insets.get(start_f, inset)
+                if inset_spec:
+                    geom = camera_inset.cam_screen_geometry(
+                        orig_w, orig_h, out_w, out_h, inset_spec)
+                    bands[start_f] = geom["content_band"]
+                    seams[start_f] = geom["seam_y_fraction"]
+                    graph = camera_inset.inset_filtergraph(
+                        orig_w, orig_h, out_w, out_h, inset_spec)
+                else:
+                    fg_h = full_width_content_height(orig_w, orig_h, out_w)
+                    graph = general_filtergraph(out_w, out_h, fg_h)
+                    bands[start_f] = screencast_layout.content_band(out_h, fg_h)
             elif strategy == 'SCREENCAST':
                 graph = screencast_layout.screencast_filtergraph(
                     orig_w, orig_h, out_w, out_h, *screencasts[start_f])
@@ -884,6 +1079,9 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
                 fg_h = full_width_content_height(orig_w, orig_h, out_w)
                 graph = general_filtergraph(out_w, out_h, fg_h)
                 bands[start_f] = screencast_layout.content_band(out_h, fg_h)
+            elif strategy == 'PANEL' and start_f in panels:
+                graph = panel_layout.panel_filtergraph(
+                    orig_w, orig_h, out_w, out_h, panels[start_f])
             elif strategy == 'SPLIT':
                 left, right = splits[start_f]
                 graph = split_layout.split_filtergraph(
@@ -928,9 +1126,11 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
         shutil.rmtree(workdir, ignore_errors=True)
 
     # Tell the caption pass which stretches are stacked, and the hook where a
-    # WIDE picture sits (see layout_ranges).
-    layout_ranges.write(final_output_video,
-                        [(s / fps, e / fps, strategy, bands.get(s))
-                         for s, e, strategy in ranges])
+    # WIDE/INSET picture sits (see layout_ranges).
+    layout_ranges.write(
+        final_output_video,
+        [(s / fps, e / fps, strategy, bands.get(s), seams.get(s),
+          inset_confidence if strategy in ('INSET', 'CAM_SCREEN') else None)
+         for s, e, strategy in ranges])
     print(f"   ✅ Clip saved to {final_output_video}")
     return True

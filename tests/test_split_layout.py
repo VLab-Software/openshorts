@@ -74,6 +74,14 @@ class TestAnalyzeScene:
         left, right = analyze_scene(frames, frame_w=1920)
         assert left[0] < right[0]
 
+    def test_three_person_podcast_mosaic_is_rejected(self):
+        # Regression for 3-person podcast (e.g. BRKsEDU): picking the 2 largest
+        # faces out of 3 separated speakers duplicated the middle speaker in
+        # both halves and cut off the 3rd speaker.
+        trio = [face(350, 400), face(960, 400), face(1570, 400)]
+        frames = [trio for _ in range(10)]
+        assert analyze_scene(frames, frame_w=1920) is None
+
 
 class TestSplitGeometry:
     def test_half_frame_crop_never_exceeds_the_source(self):
@@ -133,3 +141,18 @@ class TestSplitFiltergraph:
     def test_both_halves_scale_to_the_same_size(self):
         graph = split_filtergraph(1920, 1080, 1080, 1920, (600, 400), (1400, 400))
         assert graph.count("scale=1080:960") == 2
+
+    def test_halves_do_not_swallow_the_other_speakers_face(self):
+        # Even when two speakers sit 450px apart on a 1920 frame, neither crop
+        # may reach the other speaker's face centre.
+        left_c = (650, 400, 180, 180)
+        right_c = (1100, 400, 180, 180)
+        graph = split_filtergraph(1920, 1080, 1080, 1920, left_c, right_c)
+        top = graph.split("[ta]crop=")[1].split(",")[0]
+        bottom = graph.split("[ba]crop=")[1].split(",")[0]
+        top_w = int(top.split("w=")[1].split(":")[0])
+        top_x = int(top.split("x=")[1].split(":")[0])
+        bot_w = int(bottom.split("w=")[1].split(":")[0])
+        bot_x = int(bottom.split("x=")[1].split(":")[0])
+        assert top_x + top_w < right_c[0]
+        assert bot_x > left_c[0]

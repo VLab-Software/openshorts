@@ -22,6 +22,7 @@ import json
 import os
 
 SIDECAR_SUFFIX = ".layout.json"
+SEAM_LAYOUTS = frozenset({"split", "inset", "cam_screen"})
 
 
 def sidecar_path(video_path):
@@ -30,18 +31,30 @@ def sidecar_path(video_path):
 
 def write(video_path, ranges):
     """``ranges``: iterable of (start_s, end_s, strategy) or (start_s, end_s,
-    strategy, content), ``content`` being the (top, bottom) frame fractions
-    the picture fills on a layout that floats it over a blurred backdrop
-    (WIDE), or None. Best effort: a failure here must never fail a render that
-    already succeeded."""
+    strategy, content) or dicts, ``content`` being the (top, bottom) frame
+    fractions the picture fills on a layout that floats it over a blurred
+    backdrop (WIDE / INSET), or None. Best effort: a failure here must never
+    fail a render that already succeeded."""
     payload = []
     for r in ranges:
-        s, e, layout = r[:3]
+        if isinstance(r, dict):
+            s, e, layout = r["start"], r["end"], r.get("layout", "")
+            band = _band(r.get("content"))
+            seam = _seam(r.get("seam"))
+            conf = _confidence(r.get("confidence"))
+        else:
+            s, e, layout = r[:3]
+            band = _band(r[3] if len(r) > 3 else None)
+            seam = _seam(r[4] if len(r) > 4 else None)
+            conf = _confidence(r[5] if len(r) > 5 else None)
         entry = {"start": round(float(s), 3), "end": round(float(e), 3),
                  "layout": str(layout).lower()}
-        band = _band(r[3] if len(r) > 3 else None)
         if band:
             entry["content"] = list(band)
+        if seam is not None:
+            entry["seam"] = seam
+        if conf is not None:
+            entry["confidence"] = conf
         payload.append(entry)
     try:
         with open(sidecar_path(video_path), "w") as f:
@@ -75,6 +88,28 @@ def _band(value):
     return None
 
 
+def _seam(value):
+    """A valid vertical seam fraction in (0.0, 1.0), or None."""
+    if value is None:
+        return None
+    try:
+        v = round(float(value), 4)
+    except (TypeError, ValueError):
+        return None
+    return v if 0.0 < v < 1.0 else None
+
+
+def _confidence(value):
+    """A valid confidence score in [0.0, 1.0], or None."""
+    if value is None:
+        return None
+    try:
+        v = round(float(value), 3)
+    except (TypeError, ValueError):
+        return None
+    return v if 0.0 <= v <= 1.0 else None
+
+
 def normalise(ranges):
     """Accept the sidecar/metadata shape or bare tuples; drop anything odd
     (an old metadata file, a hand-edited value) instead of raising. A
@@ -85,9 +120,13 @@ def normalise(ranges):
             if isinstance(r, dict):
                 s, e, layout = r["start"], r["end"], r.get("layout", "")
                 band = r.get("content")
+                seam = r.get("seam")
+                conf = r.get("confidence")
             else:
                 s, e, layout = r[:3]
                 band = r[3] if len(r) > 3 else None
+                seam = r[4] if len(r) > 4 else None
+                conf = r[5] if len(r) > 5 else None
             s, e = float(s), float(e)
         except (KeyError, TypeError, ValueError):
             continue
@@ -96,13 +135,24 @@ def normalise(ranges):
             band = _band(band)
             if band:
                 entry["content"] = list(band)
+            seam = _seam(seam)
+            if seam is not None:
+                entry["seam"] = seam
+            conf = _confidence(conf)
+            if conf is not None:
+                entry["confidence"] = conf
             out.append(entry)
     return out
 
 
 def split_ranges(ranges):
-    """(start, end) pairs of the stretches where captions belong on the seam."""
-    return [(r["start"], r["end"]) for r in normalise(ranges) if r["layout"] == "split"]
+    """(start, end) pairs of the stretches where captions belong on the central
+    seam (both stacked SPLIT and top-camera / bottom-screen INSET/CAM_SCREEN)."""
+    return [
+        (r["start"], r["end"])
+        for r in normalise(ranges)
+        if r["layout"] in SEAM_LAYOUTS
+    ]
 
 
 def in_split(t, splits):
@@ -133,6 +183,10 @@ def remap(ranges, segments):
                          "layout": r["layout"]}
                 if "content" in r:
                     moved["content"] = r["content"]
+                if "seam" in r:
+                    moved["seam"] = r["seam"]
+                if "confidence" in r:
+                    moved["confidence"] = r["confidence"]
                 out.append(moved)
         offset += seg_e - seg_s
     return out

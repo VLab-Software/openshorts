@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Link2, Upload, FileVideo, X, Info, Loader2, ChevronDown } from 'lucide-react';
+import { Link2, Upload, FileVideo, X, Info, Loader2, ChevronDown, Radio } from 'lucide-react';
 import { track } from '../lib/analytics';
 import { getApiUrl } from '../config';
 import SourceCost from './SourceCost';
@@ -33,7 +33,7 @@ const readVideoDuration = (file) => new Promise((resolve) => {
 export default function MediaInput({ onProcess, isProcessing }) {
     const [youtubeUrlEnabled, setYoutubeUrlEnabled] = useState(true);
     // File upload is the primary path; the link is secondary.
-    const [mode, setMode] = useState('file'); // 'file' | 'url'
+    const [mode, setMode] = useState('file'); // 'file' | 'url' | 'live'
     const [url, setUrl] = useState('');
     const [file, setFile] = useState(null);
     const [fileSeconds, setFileSeconds] = useState(null);
@@ -43,6 +43,10 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [range, setRange] = useState(null);
     const [outputFormat, setOutputFormat] = useState('vertical'); // vertical | horizontal | square
     const [showInfo, setShowInfo] = useState(false);
+    // Live stream real-time clipping controls
+    const [liveChunkMinutes, setLiveChunkMinutes] = useState(10);
+    const [liveMinScore, setLiveMinScore] = useState(75);
+    const [liveMaxClipsPerChunk, setLiveMaxClipsPerChunk] = useState(2);
     // Advanced generation controls — empty string means "let the AI decide",
     // which keeps the default pipeline behavior untouched.
     const [showAdvanced, setShowAdvanced] = useState(false);
@@ -137,6 +141,17 @@ export default function MediaInput({ onProcess, isProcessing }) {
         } catch { /* ignore */ }
         if (mode === 'url' && url) {
             onProcess({ type: 'url', payload: url, acknowledged: true, outputFormat, ...advanced });
+        } else if (mode === 'live' && url) {
+            onProcess({
+                type: 'live',
+                payload: url,
+                acknowledged: true,
+                outputFormat,
+                chunkMinutes: liveChunkMinutes,
+                minScore: liveMinScore,
+                maxClipsPerChunk: liveMaxClipsPerChunk,
+                ...advanced,
+            });
         } else if (mode === 'file' && file && !fileTooShort) {
             onProcess({ type: 'file', payload: file, acknowledged: true, outputFormat, ...advanced });
         }
@@ -173,6 +188,18 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     >
                         <Link2 size={16} className={`hidden sm:block ${mode === 'url' ? 'text-brass' : ''}`} />
                         Video URL
+                    </button>
+                )}
+                {youtubeUrlEnabled && (
+                    <button
+                        onClick={() => setMode('live')}
+                        className={`flex items-center gap-2 pb-3 px-1 -mb-px border-b-2 text-sm lowercase whitespace-nowrap transition-colors ${mode === 'live'
+                            ? 'text-ink border-brass'
+                            : 'text-muted border-transparent hover:text-ink2'
+                            }`}
+                    >
+                        <Radio size={16} className={`hidden sm:block ${mode === 'live' ? 'text-danger animate-pulse' : ''}`} />
+                        Live Stream
                     </button>
                 )}
             </div>
@@ -215,6 +242,64 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 )}
                             </div>
                         </div>
+                    </div>
+                ) : mode === 'live' ? (
+                    <div className="space-y-4" data-tutorial="drop-zone">
+                        <div className="relative">
+                            <input
+                                type="url"
+                                value={url}
+                                onChange={(e) => setUrl(e.target.value)}
+                                placeholder="https://youtube.com/@channel/live or twitch.tv/..."
+                                className="input-field"
+                                required
+                            />
+                        </div>
+                        <div className="grid grid-cols-3 gap-2">
+                            <div>
+                                <p className="eyebrow mb-1.5">window (min)</p>
+                                <select
+                                    value={liveChunkMinutes}
+                                    onChange={(e) => setLiveChunkMinutes(Number(e.target.value))}
+                                    className="input-field text-xs py-2"
+                                    aria-label="window minutes"
+                                >
+                                    <option value={5}>5 min</option>
+                                    <option value={10}>10 min</option>
+                                    <option value={15}>15 min</option>
+                                </select>
+                            </div>
+                            <div>
+                                <p className="eyebrow mb-1.5">min AI score</p>
+                                <select
+                                    value={liveMinScore}
+                                    onChange={(e) => setLiveMinScore(Number(e.target.value))}
+                                    className="input-field text-xs py-2"
+                                    aria-label="minimum AI score"
+                                >
+                                    <option value={70}>70+ (Normal)</option>
+                                    <option value={75}>75+ (Strict)</option>
+                                    <option value={80}>80+ (Viral only)</option>
+                                    <option value={85}>85+ (Top tier)</option>
+                                </select>
+                            </div>
+                            <div>
+                                <p className="eyebrow mb-1.5">max / window</p>
+                                <select
+                                    value={liveMaxClipsPerChunk}
+                                    onChange={(e) => setLiveMaxClipsPerChunk(Number(e.target.value))}
+                                    className="input-field text-xs py-2"
+                                    aria-label="max clips per window"
+                                >
+                                    <option value={1}>1 clip</option>
+                                    <option value={2}>2 clips</option>
+                                    <option value={3}>3 clips</option>
+                                </select>
+                            </div>
+                        </div>
+                        <p className="text-[11px] leading-relaxed text-muted">
+                            Monitors the live broadcast in rolling {liveChunkMinutes}-minute windows. Silent/AFK stretches and weak moments (&lt;{liveMinScore} score) are skipped without rendering, and raw recording buffers are deleted automatically after each window.
+                        </p>
                     </div>
                 ) : (
                     <div
@@ -259,13 +344,15 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     </div>
                 )}
 
-                <SourceCost
-                    mode={mode}
-                    url={url}
-                    fileSeconds={fileSeconds}
-                    range={range}
-                    onRangeChange={setRange}
-                />
+                {mode !== 'live' && (
+                    <SourceCost
+                        mode={mode}
+                        url={url}
+                        fileSeconds={fileSeconds}
+                        range={range}
+                        onRangeChange={setRange}
+                    />
+                )}
 
                 {/* Output format selector */}
                 <div className="mt-5" data-tutorial="output-format">
@@ -419,17 +506,17 @@ export default function MediaInput({ onProcess, isProcessing }) {
                 <button
                     type="submit"
                     data-tutorial="generate"
-                    disabled={isProcessing || !acknowledged || (mode === 'url' && !url) || (mode === 'file' && (!file || fileTooShort))}
+                    disabled={isProcessing || !acknowledged || ((mode === 'url' || mode === 'live') && !url) || (mode === 'file' && (!file || fileTooShort))}
                     className="w-full btn-primary mt-4"
                 >
                     {isProcessing ? (
                         <>
                             <Loader2 size={16} className="animate-spin" />
-                            Processing Video...
+                            {mode === 'live' ? 'Monitoring Live Stream...' : 'Processing Video...'}
                         </>
                     ) : (
                         <>
-                            Generate Clips
+                            {mode === 'live' ? 'Start Live Clipping' : 'Generate Clips'}
                         </>
                     )}
                 </button>

@@ -88,10 +88,14 @@ def face_cost(rect, frames):
     return total / len(frames)
 
 
+SEAM_LAYOUTS = frozenset({"split", "inset", "cam_screen"})
+
+
 def caption_bands(ranges, window_start, window_end, has_captions=True):
     """The caption bands the hook must stay off during its window.
-    ``ranges`` is the clip's layout_ranges: SPLIT stretches put captions on
-    the seam, everything else (or no sidecar at all) at the bottom."""
+    ``ranges`` is the clip's layout_ranges: SPLIT and INSET/CAM_SCREEN
+    stretches put captions on the central seam, everything else (or no
+    sidecar at all) at the bottom."""
     if not has_captions:
         return []
     bands = set()
@@ -105,7 +109,7 @@ def caption_bands(ranges, window_start, window_end, has_captions=True):
         if e <= s:
             continue
         covered += e - s
-        bands.add(SEAM_CAPTIONS if layout == "split" else BOTTOM_CAPTIONS)
+        bands.add(SEAM_CAPTIONS if layout in SEAM_LAYOUTS else BOTTOM_CAPTIONS)
     # Any part of the window no range describes keeps the default captions.
     if covered < (window_end - window_start) - 1e-3:
         bands.add(BOTTOM_CAPTIONS)

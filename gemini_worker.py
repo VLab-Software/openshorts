@@ -112,7 +112,9 @@ meaning is on the screen, not in the face.
    summary of the video's general topic, never a slogan that would fit any
    clip of this video, never drop a figure for a vaguer phrase.
 3. `video_title_for_youtube_short`: max 100 chars, same rule, in
-   TRANSCRIPT_LANGUAGE, no fake claims.
+   TRANSCRIPT_LANGUAGE, no fake claims. If the speaker is discussing a rumor,
+   leak, theory, prediction or personal opinion, keep that qualification in
+   both the hook and the title — never state speculation as confirmed fact.
 
 The current hook and title below were written WITHOUT seeing the frames and
 are the kind of topic summary you must replace. Do not reuse their wording.
@@ -344,6 +346,10 @@ COPY RULES — ALL text fields (descriptions, title, hook) MUST be written in TR
 - Descriptions (TikTok + Instagram): 1-2 punchy sentences that tease the payoff
   without spoiling it, then 3-5 topically relevant hashtags. No generic hashtag spam.
 - `video_title_for_youtube_short`: max 100 chars, curiosity-driven, no fake claims.
+- EPISTEMIC HONESTY: when the speaker expresses a personal opinion, prediction,
+  theory, leak or rumor, qualify it in `viral_hook_text` and
+  `video_title_for_youtube_short` (e.g. as a question, theory, or opinion) —
+  never turn speculation or rumor into an unqualified factual claim.
 - `predicted_score`: honest 0-100 estimate of viral potential.
 - `why`: one sentence, max 20 words, naming what makes THIS moment worth a
   clip — the specific hook, claim, number or payoff, not the topic.

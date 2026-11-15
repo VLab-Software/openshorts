@@ -38,6 +38,9 @@ services:
     restart: unless-stopped
     ports:
       - "5175:5173"
+    labels:
+      - 'traefik.http.middlewares.openshorts-auth.basicauth.users=admin:$2y$05$TWqFCG/uNbxnJq3dX/Y0mOR4aXzaxMVRkfaX4mcp47P3xkwGo2Wcq'
+      - 'coolify.traefik.middlewares=openshorts-auth'
     environment:
       VITE_PROXY_TARGET: http://backend:8000
       VITE_RENDER_TARGET: http://renderer:3100

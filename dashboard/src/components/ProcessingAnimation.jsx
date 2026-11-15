@@ -38,7 +38,7 @@ const ProcessingAnimation = ({ media, isComplete, syncedTime, isSyncedPlaying, s
         }
       })();
       return () => { cancelled = true; };
-    } else if (media.type === 'url') {
+    } else if (media.type === 'url' || media.type === 'live') {
       setIsYouTube(true);
       const videoId = getYouTubeId(media.payload);
       setVideoSrc(videoId);

@@ -133,6 +133,30 @@ class TestReframeRender:
         meta = json.loads(job["meta_path"].read_text())
         assert meta["shorts"][0]["crop_overrides"]["0"] == 0.2
 
+    def test_renders_cam_screen_override_from_source(self, job, fake_recut):
+        resp = _request("POST", "/api/clip/reframe", {
+            "job_id": JOB_ID, "clip_index": 0,
+            "crop_overrides": {
+                "0": {
+                    "camera": {"x": 0.02, "y": 0.03, "w": 0.22, "h": 0.22},
+                    "screen": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+                }
+            }})
+        assert resp.status_code == 200
+        call = fake_recut[0]
+        assert call["crop_overrides"][0]["camera"]["w"] == 0.22
+        assert call["crop_overrides"][0]["screen"]["w"] == 1.0
+
+    def test_clip_review_endpoint_records_human_approval(self, job):
+        resp = _request("POST", "/api/clip/review", {
+            "job_id": JOB_ID, "clip_index": 0,
+            "status": "approved", "notes": "Rosto e HUD verificados manualmente"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["quality_gate"]["review_status"] == "approved"
+        assert body["quality_gate"]["needs_review"] is False
+        assert body["quality_gate"]["review_notes"] == "Rosto e HUD verificados manualmente"
+
     def test_reapply_captions_false(self, job, fake_recut):
         resp = _request("POST", "/api/clip/reframe", {
             "job_id": JOB_ID, "clip_index": 0, "reapply_captions": False,

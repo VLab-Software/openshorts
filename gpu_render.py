@@ -213,6 +213,17 @@ def _vstack(inputs):
     return _Canvas(width, y, layers)
 
 
+def _hstack(inputs):
+    height = inputs[0].h
+    layers, x = [], 0
+    for s in inputs:
+        if s.h != height:
+            raise Unsupported("hstack of different heights")
+        layers += _shifted(_as_canvas(s), x, 0)
+        x += s.w
+    return _Canvas(x, height, layers)
+
+
 def _pad(s, opts):
     color = opts.get("color", opts.get("c", "black")).lower()
     if color not in ("black", "0x000000", "#000000"):
@@ -273,6 +284,11 @@ def layers_from_graph(graph, src_w, src_h, out_w, out_h, src_label="[0:v]"):
                 if int(opts.get("inputs", 2)) != len(cur):
                     raise Unsupported("vstack inputs")
                 cur = [_vstack(cur)]
+            elif name == "hstack":
+                opts = _options(args, ["inputs"])
+                if int(opts.get("inputs", 2)) != len(cur):
+                    raise Unsupported("hstack inputs")
+                cur = [_hstack(cur)]
             elif name == "pad":
                 cur = [_pad(cur[0], _options(args, ["w", "h", "x", "y", "color"]))]
             else:

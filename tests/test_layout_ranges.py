@@ -27,6 +27,41 @@ class TestSidecar:
                        {"start": 4.5, "end": 10.0, "layout": "split"}]
         assert layout_ranges.split_ranges(got) == [(4.5, 10.0)]
 
+    def test_inset_and_cam_screen_also_use_central_seam(self, tmp_path):
+        clip = str(tmp_path / "clip_cam.mp4")
+        layout_ranges.write(
+            clip,
+            [(0, 5.0, "INSET", [0.05, 0.90], 0.48, 0.92),
+             (5.0, 10.0, "CAM_SCREEN")],
+        )
+        got = layout_ranges.read(clip)
+        assert layout_ranges.split_ranges(got) == [(0.0, 5.0), (5.0, 10.0)]
+        assert got[0]["seam"] == 0.48
+        assert got[0]["confidence"] == 0.92
+
+    def test_layout_caption_adjustments_scales_multi_region_layouts(self):
+        adj_track = subtitles.layout_caption_adjustments(
+            [{"start": 0, "end": 10, "layout": "track"}],
+            base_font_size=44, base_max_chars=16,
+        )
+        assert adj_track["font_size"] == 44
+        assert not adj_track["central_seam"]
+
+        adj_inset = subtitles.layout_caption_adjustments(
+            [{"start": 0, "end": 10, "layout": "inset"}],
+            base_font_size=44, base_max_chars=16,
+        )
+        assert adj_inset["font_size"] < 44
+        assert adj_inset["central_seam"] is True
+        assert adj_inset["max_lines"] == 2
+
+        adj_panel = subtitles.layout_caption_adjustments(
+            [{"start": 0, "end": 10, "layout": "panel"}],
+            base_font_size=44, base_max_chars=16,
+        )
+        assert adj_panel["font_size"] < adj_inset["font_size"]
+        assert adj_panel["max_chars"] <= 14
+
     def test_missing_sidecar_is_empty(self, tmp_path):
         assert layout_ranges.read(str(tmp_path / "nope.mp4")) == []
 

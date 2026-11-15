@@ -298,6 +298,48 @@ def line_budget(font_name, font_size):
     return max(6, round(_LINE_CHARS.get(font_name, 14) * 44 / size))
 
 
+def layout_caption_adjustments(ranges=None, base_font_size=44, base_max_chars=16):
+    """Adapt subtitle font size and line budget to the clip's active layouts.
+
+    On multi-panel podcast mosaics (``panel``) or dual-region layouts
+    (``split``, ``inset``, ``cam_screen``), oversized 44pt captions compete
+    with faces and HUD elements. Returning a slightly smaller font and a
+    strict two-line budget keeps captions readable on mobile without covering
+    mouths, eyes, or game UI.
+    """
+    import layout_ranges as lr
+
+    norm = lr.normalise(ranges) if ranges else []
+    layouts = {r.get("layout", "") for r in norm}
+    font_size = int(_clamp_number(base_font_size, 10, 200, 44))
+    max_chars = int(_clamp_number(base_max_chars, 1, 80, 16))
+
+    if "panel" in layouts:
+        adj_size = max(24, round(font_size * 0.82))
+        adj_chars = max(1, min(max_chars, 14)) if max_chars > 1 else 1
+        return {
+            "font_size": adj_size,
+            "max_chars": adj_chars,
+            "max_lines": 2,
+            "central_seam": bool(layouts & lr.SEAM_LAYOUTS),
+        }
+    if layouts & lr.SEAM_LAYOUTS:
+        adj_size = max(26, round(font_size * 0.88))
+        adj_chars = max(1, min(max_chars, 16)) if max_chars > 1 else 1
+        return {
+            "font_size": adj_size,
+            "max_chars": adj_chars,
+            "max_lines": 2,
+            "central_seam": True,
+        }
+    return {
+        "font_size": font_size,
+        "max_chars": max_chars,
+        "max_lines": 2,
+        "central_seam": False,
+    }
+
+
 def _ass_time(seconds):
     """Format seconds as ASS timestamp H:MM:SS.cc (centiseconds)."""
     seconds = max(0, seconds)
